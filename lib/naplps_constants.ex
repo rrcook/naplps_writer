@@ -99,6 +99,13 @@ defmodule NaplpsConstants do
       @hatching_solid        0xC0
       @hatching_vertical     0xC8
 
+      @gr_word_wrap_on       0x95
+      @gr_word_wrap_off      0x96
+      @gr_scroll_on          0x97
+      @gr_scroll_off         0x98
+      @gr_underline_start    0x99
+      @gr_underline_stop     0x9A
+
     end
   end
 end
