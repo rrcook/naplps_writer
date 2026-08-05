@@ -39,6 +39,28 @@ defmodule TelidrawTranspilerTest do
       # move = 0xA4 + 3 vertex bytes (4 total); line opcode 0xA8 follows.
       assert <<0xA4, _::binary-size(3), 0xA8, _::binary-size(3)>> = bare("move 0 0\nline 0.5 0.5")
     end
+
+    test "line accepts multiple x/y pairs as one polyline" do
+      # 3 pairs -> a single 0xA8 opcode followed by 3 encoded vertices (9 bytes).
+      pts = [{0.2, 0.2}, {0.3, 0.3}, {0.4, 0.4}]
+      expected = <<0xA8>> <> NaplpsWriter.mb_xy(<<>>, pts)
+      assert bare("line 0.2 0.2 0.3 0.3 0.4 0.4") == expected
+    end
+
+    test "line-rel accepts multiple x/y pairs as one polyline" do
+      pts = [{0.1, 0.0}, {0.0, 0.1}, {-0.1, 0.0}]
+      expected = <<0xA9>> <> NaplpsWriter.mb_xy(<<>>, pts)
+      assert bare("line-rel 0.1 0.0 0.0 0.1 -0.1 0.0") == expected
+    end
+
+    test "a single-pair line is unchanged (one vertex)" do
+      assert bare("line 0.5 0.5") == <<0xA8>> <> NaplpsWriter.mb_xy(<<>>, {0.5, 0.5})
+    end
+
+    test "line requires whole x/y pairs" do
+      assert {:error, diags} = TelidrawTranspiler.transpile("line 0.1 0.2 0.3")
+      assert Enum.any?(diags, &(&1.message =~ "pairs"))
+    end
   end
 
   describe "color" do
