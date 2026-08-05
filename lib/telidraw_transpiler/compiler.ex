@@ -162,7 +162,7 @@ defmodule TelidrawTranspiler.Compiler do
         with_xy(c, state, fn x, y, st -> emit_point(st, x, y) end)
 
       :line ->
-        with_xy(c, state, fn x, y, st -> emit_line(st, x, y) end)
+        emit_polyline(c, state, @op_line_abs, false, "line")
 
       :rect ->
         with_xy(c, state, fn w, h, st -> emit_rect_filled(st, w, h) end)
@@ -183,9 +183,7 @@ defmodule TelidrawTranspiler.Compiler do
         end)
 
       :line_rel ->
-        with_xy(c, state, fn dx, dy, st ->
-          draw(st, @op_line_rel, {nx(st, dx), ny(st, dy)})
-        end)
+        emit_polyline(c, state, @op_line_rel, true, "line-rel")
 
       :arc ->
         with_n(c, 4, state, fn [mx, my, ex, ey], st ->
@@ -204,10 +202,10 @@ defmodule TelidrawTranspiler.Compiler do
         emit_polygon(c, state, @op_poly_outlined)
 
       :line_set ->
-        emit_line_set(c, state, false)
+        emit_polyline(c, state, @op_set_line_abs, false, "line-set")
 
       :line_set_rel ->
-        emit_line_set(c, state, true)
+        emit_polyline(c, state, @op_set_line_rel, true, "line-set-rel")
 
       :rect_set ->
         emit_rect_set(c, state, @op_set_rect_filled)
@@ -284,11 +282,6 @@ defmodule TelidrawTranspiler.Compiler do
     state |> draw(@op_point_abs, {nxv, nyv}) |> set_pen({nxv, nyv})
   end
 
-  defp emit_line(state, x, y) do
-    {nxv, nyv} = {nx(state, x), ny(state, y)}
-    state |> draw(@op_line_abs, {nxv, nyv}) |> set_pen({nxv, nyv})
-  end
-
   defp emit_rect_filled(state, w, h) do
     {nwv, nhv} = {nx(state, w), ny(state, h)}
     {px, py} = state.pen
@@ -319,20 +312,27 @@ defmodule TelidrawTranspiler.Compiler do
     end
   end
 
-  defp emit_line_set(%{args: args} = c, state, relative) do
+  # Shared emitter for the polyline verbs: `line`, `line-rel`, `line-set`,
+  # `line-set-rel`. Each takes one or more x/y pairs and draws the whole
+  # connected run in a single command (opcode + N encoded vertices).
+  #
+  #   * absolute forms encode each vertex absolutely and advance the pen to the
+  #     last vertex;
+  #   * relative forms encode each pair as a delta and leave the pen unchanged
+  #     (deltas are emitted verbatim — the pen tracker is only used as the anchor
+  #     for absolute-relative conversions elsewhere).
+  defp emit_polyline(%{args: args} = c, state, opcode, relative, verb) do
     if valid_pairs?(args) do
       {nums, state} = eval_all(args, state)
       pts = norm_points(state, nums)
 
       if relative do
-        # deltas are emitted verbatim; pen is not advanced (mirrors reference)
-        draw(state, @op_set_line_rel, pts)
+        draw(state, opcode, pts)
       else
-        state |> draw(@op_set_line_abs, pts) |> set_pen(List.last(pts))
+        state |> draw(opcode, pts) |> set_pen(List.last(pts))
       end
     else
-      verb = if relative, do: "line-set-rel", else: "line-set"
-      add_diag(state, c, "#{verb} needs pairs of coords (got #{length(args)})")
+      add_diag(state, c, "#{verb} needs pairs of x,y coords (got #{length(args)})")
     end
   end
 
