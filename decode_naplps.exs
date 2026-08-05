@@ -1,61 +1,9 @@
-defmodule XYDecoder do
-  def build_bits(bytes) do
-    <<0b11::2, xbit9::1, xbit8::1, xbit7::1, ybit9::1, ybit8::1, ybit7::1, 0b11::2, xbit6::1,
-      xbit5::1, xbit4::1, ybit6::1, ybit5::1, ybit4::1, 0b11::2, xbit3::1, xbit2::1, xbit1::1,
-      ybit3::1, ybit2::1, ybit1::1>> = bytes
-
-    {[xbit9, xbit8, xbit7, xbit6, xbit5, xbit4, xbit3, xbit2, xbit1],
-     [ybit9, ybit8, ybit7, ybit6, ybit5, ybit4, ybit3, ybit2, ybit1]}
-  end
-
-  def bitlist_to_byte(bitlist) do
-    for b <- bitlist, into: <<>>, do: <<b::size(1)>>
-  end
-
-  def byte_to_bitlist(byte) do
-    for <<bit::1 <- byte>>, do: bit
-  end
-
-  def twos(binary) do
-    <<value>> = binary
-    comp = Bitwise.bnot(value) + 1
-    <<comp>>
-  end
-
-  def mul_256(xys), do: Enum.map(xys, fn {x, y} -> {x * 256, y * 256} end)
-  def div_256(xys), do: Enum.map(xys, fn {x, y} -> {x / 256, y / 256} end)
-
-  def calculate(bitlist) do
-    sign = hd(bitlist)
-
-    cond do
-      sign == 1 ->
-        twos_bitlist = bitlist_to_byte(tl(bitlist)) |> twos |> byte_to_bitlist
-        -1 * calc(twos_bitlist, 0.5, 0)
-
-      true ->
-        calc(tl(bitlist), 0.5, 0)
-    end
-  end
-
-  def calc([], _multiplier, acc), do: acc
-
-  def calc([hd | tl], multiplier, acc), do: calc(tl, multiplier / 2, acc + hd * multiplier)
-
-  def dechunk(bytes), do: dechk(bytes, [])
-
-  def dechk(<<>>, acc), do: Enum.reverse(acc)
-
-  def dechk(<<b1::8, b2::8, b3::8, rest::binary>>, acc) do
-    chunk = <<b1, b2, b3>>
-    {xs, ys} = build_bits(chunk)
-    dechk(rest, [{calculate(xs), calculate(ys)} | acc])
-  end
-
-  def text_to_xys(text) do
-    {:ok, data} = Base.decode16(text)
-    dechunk(data) |> mul_256
-  end
+# Coordinate decoding lives in XYUtilities (lib/xy_utilities.ex), which is
+# unit-tested. Load it from source when running standalone (`elixir
+# decode_naplps.exs ...`); under `mix run` it is already compiled and on the
+# code path, so skip the reload.
+unless Code.ensure_loaded?(XYUtilities) do
+  Code.require_file("lib/xy_utilities.ex", __DIR__)
 end
 
 defmodule NAPLPSDecoder do
@@ -159,7 +107,7 @@ defmodule NAPLPSDecoder do
     "0°",
     "90°",
     "180°",
-    "360°"
+    "270°"
   ]
 
   @cursor_style [
@@ -190,58 +138,13 @@ defmodule NAPLPSDecoder do
   @doc """
   Check if byte is a data byte (0xC0-0xFF in 8-bit mode)
   """
-  def is_data_byte?(byte), do: Bitwise.band(byte, 0xC0) == 0xC0
+  def data_byte?(byte), do: Bitwise.band(byte, 0xC0) == 0xC0
 
   @doc """
   Check if byte is a PDI command (0xA0-0xBF in 8-bit mode, or 0x20-0x3F in 7-bit)
   """
-
-  # byte in 'normal' commands or special bytes like repeat, macros etc.
-  def is_pdi_command?(byte) do
-    cond do
-      byte in 0xA0..0xBF -> true # normal PDI commands
-      byte == 0x86 -> true # REPEAT command
-      true -> false
-    end
-
-  end #, do: byte in 0xA0..0xBF
-
-  @doc """
-  Normalize PDI command to 0x20-0x3F range
-  """
-  # def normalize_pdi(byte) when byte in 0xA0..0xBF, do: byte - 0x80
-  def normalize_pdi(byte), do: byte
-
-  @doc """
-  Decode 2D coordinate from multi-value operand
-  """
-  def decode_multi_value_2d([]), do: {nil, nil}
-
-  def decode_multi_value_2d(data) do
-    # Strip bit 7 from all data bytes first (8-bit mode has bit 7 set)
-    clean_data = Enum.map(data, &Bitwise.band(&1, 0x7F))
-
-    # First byte contains sign bits and 2 MSBs for X and Y
-    # Format: |1|Sx|X1|X0|Sy|Y1|Y0|
-    [first | rest] = clean_data
-
-    x_sign = if Bitwise.band(first, 0x20) != 0, do: -1, else: 1
-    y_sign = if Bitwise.band(first, 0x04) != 0, do: -1, else: 1
-
-    x_val = Bitwise.band(Bitwise.bsr(first, 3), 0x03)
-    y_val = Bitwise.band(first, 0x03)
-
-    # Subsequent bytes contain 3 bits each for X and Y
-    # Format: |1|X2|X1|X0|Y2|Y1|Y0|
-    {x_final, y_final} =
-      Enum.reduce(rest, {x_val, y_val}, fn byte, {x_acc, y_acc} ->
-        x_bits = Bitwise.band(Bitwise.bsr(byte, 3), 0x07)
-        y_bits = Bitwise.band(byte, 0x07)
-        {Bitwise.bsl(x_acc, 3) + x_bits, Bitwise.bsl(y_acc, 3) + y_bits}
-      end)
-
-    {x_sign * x_final, y_sign * y_final}
-  end
+  # 0xA0..0xBF are the normal PDI commands; 0x86 is the REPEAT command.
+  def pdi_command?(byte), do: byte in 0xA0..0xBF or byte == 0x86
 
   @doc """
   Color from the color palette value
@@ -285,9 +188,9 @@ defmodule NAPLPSDecoder do
   end
 
   defp collect_data_bytes(data, pos, acc) when pos < byte_size(data) do
-    <<_skip::binary-size(pos), byte, _rest::binary>> = data
+    <<_skip::binary-size(^pos), byte, _rest::binary>> = data
 
-    if is_data_byte?(byte) do
+    if data_byte?(byte) do
       collect_data_bytes(data, pos + 1, acc ++ [byte])
     else
       {acc, pos}
@@ -297,29 +200,14 @@ defmodule NAPLPSDecoder do
   defp collect_data_bytes(_data, pos, acc), do: {acc, pos}
 
   @doc """
-  Decode coordinates from data bytes
+  Decode coordinates from data bytes.
+
+  Note: XYUtilities.dechunk/1 only handles the 3-byte multi-value format, so the
+  multi_value_bytes size tracked in state is ignored here.
   """
   def decode_coordinates(data_bytes, _multi_value_bytes) do
-    XYDecoder.dechunk(IO.iodata_to_binary(data_bytes)) |> XYDecoder.mul_256()
+    XYUtilities.dechunk(IO.iodata_to_binary(data_bytes)) |> XYUtilities.mul_256()
   end
-
-  def decode_coordinatesx(data_bytes, multi_value_bytes) do
-    decode_coordinatesx(data_bytes, multi_value_bytes, [])
-  end
-
-  defp decode_coordinatesx(data_bytes, multi_value_bytes, acc)
-       when length(data_bytes) >= multi_value_bytes do
-    {coord_data, rest} = Enum.split(data_bytes, multi_value_bytes)
-    {x, y} = decode_multi_value_2d(coord_data)
-
-    if x != nil do
-      decode_coordinatesx(rest, multi_value_bytes, acc ++ [{x, y}])
-    else
-      acc
-    end
-  end
-
-  defp decode_coordinatesx(_data_bytes, _multi_value_bytes, acc), do: acc
 
   defp coords_to_string([]), do: "None"
 
@@ -346,7 +234,6 @@ defmodule NAPLPSDecoder do
     else
       {"#{length(data_bytes)} data bytes", state}
     end
-
   end
 
   defp decode_params(0xA1, data_bytes, state) do
@@ -358,12 +245,8 @@ defmodule NAPLPSDecoder do
 
       multi_value_size = multi_value_bits + 1
       single_value_size = single_value_bits + 1
-      fmt = Bitwise.band(hd(data_bytes), 0x7F)
-      mv_size = Bitwise.band(Bitwise.bsr(fmt, 3), 0x07)
-      mv_bytes = [1, 2, 3, 4, 5, 6, 7, 8] |> Enum.at(mv_size)
 
-      new_state = %{state | multi_value_bytes: mv_bytes}
-      _paramsx = "format=0x#{Integer.to_string(fmt, 16)} multi_value_bytes=#{mv_bytes}"
+      new_state = %{state | multi_value_bytes: multi_value_size}
       coords_text = if xy_or_xyz == 0, do: "X/Y", else: "X/Y/Z"
       mv_text = "Multi-value size = #{multi_value_size}"
       sv_text = "Single-value size = #{single_value_size}"
@@ -380,7 +263,8 @@ defmodule NAPLPSDecoder do
     if length(data_bytes) >= state.multi_value_bytes do
       color_data = Enum.take(data_bytes, state.multi_value_bytes)
       color = decode_color(color_data)
-      {"RGB=#{inspect(color)}", state}
+      # decode_color returns {G, R, B} to match the NAPLPS bit layout.
+      {"GRB=#{inspect(color)}", state}
     else
       {"#{length(data_bytes)} data bytes", state}
     end
@@ -400,29 +284,8 @@ defmodule NAPLPSDecoder do
   end
 
   defp decode_params(norm_byte, data_bytes, state)
-       when norm_byte in [
-              0xA4,
-              0xA5,
-              0xA6,
-              0xA7,
-              0xA8,
-              0xA9,
-              0xAA,
-              0xAB,
-              0xAC,
-              0xAD,
-              0xAE,
-              0xAF,
-              0xB0,
-              0xB1,
-              0xB2,
-              0xB3,
-              0xB4,
-              0xB5,
-              0xB6,
-              0xB7
-            ] do
-    # Commands with coordinates
+       when norm_byte in 0xA4..0xB7 do
+    # Commands with coordinates (POINT/LINE/ARC/RECT/POLY, abs & rel variants)
     coords = decode_coordinates(data_bytes, state.multi_value_bytes)
 
     if coords != [] do
@@ -464,7 +327,6 @@ defmodule NAPLPSDecoder do
       <<_discard::2, hatching::3, draw_outline::1, line_texture::2>> =
         IO.iodata_to_binary([hd(data_bytes)])
 
-      # _paramsx = "format=0x#{Integer.to_string(fmt, 16)} multi_value_bytes=#{mv_bytes}"
       hatching_text = Enum.at(@fill_patterns, hatching)
       line_texture_text = Enum.at(@line_textures, line_texture)
 
@@ -504,14 +366,13 @@ defmodule NAPLPSDecoder do
   end
 
   defp decode_stream(data, pos, state) when pos < byte_size(data) do
-    <<_skip::binary-size(pos), byte, _rest::binary>> = data
+    <<_skip::binary-size(^pos), byte, _rest::binary>> = data
 
     cond do
       # Check for PDI commands (8-bit mode: 0xA0-0xBF, 7-bit mode: 0x20-0x3F)
-      is_pdi_command?(byte) ->
-        norm_byte = normalize_pdi(byte)
+      pdi_command?(byte) ->
         {data_bytes, new_pos} = collect_data_bytes(data, pos + 1)
-        {cmd_name, params, new_state} = decode_pdi(norm_byte, data_bytes, state)
+        {cmd_name, params, new_state} = decode_pdi(byte, data_bytes, state)
 
         new_state = %{new_state | commands: state.commands ++ [{cmd_name, params}]}
         decode_stream(data, new_pos, new_state)
@@ -550,7 +411,7 @@ defmodule NAPLPSDecoder do
   end
 
   defp collect_text(data, pos, acc) when pos < byte_size(data) do
-    <<_skip::binary-size(pos), byte, _rest::binary>> = data
+    <<_skip::binary-size(^pos), byte, _rest::binary>> = data
 
     cond do
       # Display carriage return
@@ -567,7 +428,6 @@ defmodule NAPLPSDecoder do
       true ->
         {acc, pos}
     end
-
   end
 
   defp collect_text(_data, pos, acc), do: {acc, pos}
