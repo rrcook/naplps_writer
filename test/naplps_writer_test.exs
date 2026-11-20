@@ -43,4 +43,30 @@ defmodule NaplpsWriterTest do
       assert rest == body <> <<0xA5, 0x85>>
     end
   end
+
+  describe "macro_call/4 (macro invocation)" do
+    test "A5 pen-relative position + ESC / z ESC o + code + restore" do
+      pos = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+      expected =
+        <<0xA5>> <> pos <> <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+      assert NaplpsWriter.macro_call(<<>>, 0x20, {0.0, 0.0}) == expected
+    end
+
+    test "A4 absolute position option" do
+      pos = NaplpsWriter.mb_xy(<<>>, {0.5, 0.5})
+      expected =
+        <<0xA4>> <> pos <> <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x41, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+      assert NaplpsWriter.macro_call(<<>>, 0x41, {0.5, 0.5}, pos_op: 0xA4) == expected
+    end
+
+    test "ss3 option uses ESC / z SS3" do
+      assert <<0xA5, _::binary-size(3), 0x1B, 0x2F, 0x7A, 0x1D, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>> =
+               NaplpsWriter.macro_call(<<>>, 0x20, {0.0, 0.0}, ss3: true)
+    end
+
+    test "appends to an existing buffer" do
+      assert <<0xBE, 0xD0, 0xA5, _::binary>> =
+               NaplpsWriter.macro_call(<<0xBE, 0xD0>>, 0x20, {0.0, 0.0})
+    end
+  end
 end

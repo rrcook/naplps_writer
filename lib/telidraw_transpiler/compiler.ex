@@ -79,6 +79,7 @@ defmodule TelidrawTranspiler.Compiler do
       procs: %{},
       macros: %{},
       next_code: 0x20,
+      first_positioned: true,
       color: 7,
       coord_mode: :fractions,
       dw: 256,
@@ -143,6 +144,7 @@ defmodule TelidrawTranspiler.Compiler do
   defp compile_statement(%{type: :proc_decl}, state), do: state
   defp compile_statement(%{type: :raw} = raw, state), do: compile_raw(raw, state)
   defp compile_statement(%{type: :def_texture} = d, state), do: compile_def_texture(d, state)
+  defp compile_statement(%{type: :macro_call} = c, state), do: compile_macro_call(c, state)
   defp compile_statement(%{type: :directive} = d, state), do: apply_directive(d, state)
 
   defp compile_statement(%{type: :palette_alias} = pa, state) do
@@ -278,7 +280,10 @@ defmodule TelidrawTranspiler.Compiler do
 
   defp emit_move(state, x, y) do
     {nxv, nyv} = {nx(state, x), ny(state, y)}
-    state |> draw(@op_point_set_abs, {nxv, nyv}) |> set_pen({nxv, nyv})
+    state
+    |> draw(@op_point_set_abs, {nxv, nyv})
+    |> set_pen({nxv, nyv})
+    |> Map.put(:first_positioned, false)
   end
 
   defp emit_point(state, x, y) do
@@ -730,6 +735,31 @@ defmodule TelidrawTranspiler.Compiler do
     {v, state} = eval(expr, state)
     c = trunc(v)
     if c in 0x20..0x7F, do: {c, state}, else: {nil, state}
+  end
+
+  # `@name args`: invoke a defined macro at the current pen. GCU positions the first positioned
+  # object absolutely (A4) and later ones pen-relative (A5); the call object's blob is the code
+  # byte, framed by the invocation escape + code-set restore (NaplpsWriter.macro_call). Args are
+  # parsed but do not change the invocation: GCU plays the recorded body regardless of call args.
+  # first_positioned is cleared by move and by a macro call (full tracking across every object
+  # type is a refinement; the common move-then-call and call-first cases are covered).
+  defp compile_macro_call(%{name: name} = c, state) do
+    case Map.fetch(state.macros, name) do
+      :error ->
+        add_diag(state, c, "Unknown macro '#{name}' (define it with @macro proc)")
+
+      {:ok, code} ->
+        {px, py} = state.pen
+        # GCU: first positioned object -> A4 absolute (the call position = the pen); later ->
+        # A5 pen-relative delta. The call is invoked at the current pen, so the delta is (0,0).
+        {pos_op, operand} =
+          if state.first_positioned, do: {0xA4, {px, py}}, else: {0xA5, {0.0, 0.0}}
+        %{
+          state
+          | buffer: NaplpsWriter.macro_call(state.buffer, code, operand, pos_op: pos_op),
+            first_positioned: false
+        }
+    end
   end
 
   # ---- DEF TEXTURE -----------------------------------------------------------

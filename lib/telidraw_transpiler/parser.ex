@@ -97,7 +97,7 @@ defmodule TelidrawTranspiler.Parser do
   defp parse_statement([%Token{kind: kind} = tok | _] = toks) do
     cond do
       kind == :proc -> parse_proc_decl(toks, false)
-      kind == :at -> parse_macro_proc(toks)
+      kind == :at -> parse_at_statement(toks)
       kind == :with -> parse_with_block(toks)
       kind == :repeat -> parse_repeat(toks)
       kind == :for -> parse_for_loop(toks)
@@ -124,6 +124,19 @@ defmodule TelidrawTranspiler.Parser do
       _ ->
         throw_error(at, "Expected '@macro' before 'proc'")
     end
+  end
+
+  # `@macro proc ...` is a macro definition; `@name args` invokes a defined macro.
+  defp parse_at_statement([%Token{kind: :at}, %Token{kind: :identifier, lexeme: "macro"} | _] = toks),
+    do: parse_macro_proc(toks)
+
+  defp parse_at_statement(toks), do: parse_macro_call(toks)
+
+  defp parse_macro_call(toks) do
+    {at, rest} = expect(toks, :at)
+    {name, rest} = expect(rest, :identifier)
+    {args, rest} = parse_command_args(rest, [])
+    {%{type: :macro_call, name: name.lexeme, args: args, line: at.line, col: at.col}, rest}
   end
 
   defp parse_proc_decl(toks, as_macro) do

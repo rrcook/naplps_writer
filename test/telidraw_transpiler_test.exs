@@ -365,4 +365,40 @@ defmodule TelidrawTranspilerTest do
       assert bare("proc p() { move 0 0 }\np") == NaplpsWriter.draw(<<>>, 0xA4, {0.0, 0.0})
     end
   end
+
+  describe "@name (macro invocation)" do
+    test "define then call: definition blob + A4 position + invoke escape + code + restore" do
+      body = NaplpsWriter.draw(<<>>, 0xA4, {1 / 256, 1 / 256})
+      defn = <<0x80, 0x20>> <> body <> <<0xA5, 0x85>>
+      pos = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+      call = <<0xA4>> <> pos <> <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+      assert bare("@macro proc m() { move 1/256 1/256 }\n@m") == defn <> call
+    end
+
+    test "after a move the call is A5 pen-relative (zero delta at the pen)" do
+      bytes = bare("move 0.5 0.5\n@macro proc m() { move 0 0 }\n@m")
+      zero = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+      assert <<0xA4, _::binary-size(3), 0x80, 0x20, _::binary-size(4), 0xA5, 0x85,
+               0xA5, rest::binary>> = bytes
+      assert rest == zero <> <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+    end
+
+    test "an undefined macro is diagnosed" do
+      assert {:error, diags} = TelidrawTranspiler.transpile("@nope", init: false)
+      assert Enum.any?(diags, &(&1.message =~ "Unknown macro"))
+    end
+
+    test "call args do not change the invocation (GCU plays the recorded body)" do
+      assert bare("@macro proc m() { move 0 0 }\n@m 1 2") ==
+               bare("@macro proc m() { move 0 0 }\n@m")
+    end
+
+    test "two calls resolve the same code; the second is A5" do
+      bytes = bare("@macro proc m() { move 0 0 }\n@m\n@m")
+      assert <<0x80, 0x20, _::binary-size(4), 0xA5, 0x85,
+               0xA4, _::binary-size(3), 0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E,
+               0xA5, _::binary-size(3), 0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>> =
+               bytes
+    end
+  end
 end

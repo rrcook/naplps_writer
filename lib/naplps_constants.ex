@@ -91,6 +91,12 @@ defmodule NaplpsConstants do
       # Emitted after a DEF TEXTURE body (src/naplps_write.c o0ec3 case 0x84 -> o092f(w, 3)).
       @esc_codeset_restore <<0x1B, 0x29, 0x57, 0x1B, 0x7E>>
 
+      # Macro invocation escapes (DS:8B7E records 5 / 8): ESC / z then ESC o (record 5, the
+      # default) or SS3 (record 8, when a single-shift is active). The macro code byte follows,
+      # then @esc_codeset_restore. src/naplps_read.c macro_call_object: set_esc(ss_active ? 8 : 5).
+      @esc_macro_invoke <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F>>
+      @esc_macro_invoke_ss3 <<0x1B, 0x2F, 0x7A, 0x1D>>
+
       #From the GCU/Prodigy palette
       @color_black           0xC0
       @color_red             0xC4

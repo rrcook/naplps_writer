@@ -139,6 +139,23 @@ defmodule NaplpsWriter do
     buffer <> <<@cmd_def_macro, code>> <> body <> <<0xA5, @cmd_end>>
   end
 
+  @doc """
+  Append a macro invocation: a position command (`pos_op` = `0xA4` POINT SET ABS or `0xA5` POINT SET
+  REL) with the encoded `{x, y}` (via `mb_xy/2`), then the invocation escape (`ESC / z ESC o`, or
+  `ESC / z SS3` with `ss3: true`), the macro `code` byte, and the code-set restore (`ESC ) W ESC ~`).
+  Mirrors GCU's macro-call object (blob = the code byte; `src/naplps_write.c` case `0x01`: position +
+  `o08fe` + blob + `o092f(3)`). The caller picks `pos_op`/`{x,y}`: GCU uses `A4` absolute for the first
+  positioned object and `A5` pen-relative deltas afterwards.
+
+      iex> NaplpsWriter.macro_call(<<>>, 0x20, {0.0, 0.0})
+      <<0xA5, 0xC0, 0xC0, 0xC0, 0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+  """
+  def macro_call(buffer, code, {x, y}, opts \\ []) when code in 0x20..0x7F do
+    pos_op = Keyword.get(opts, :pos_op, 0xA5)
+    esc = if Keyword.get(opts, :ss3, false), do: @esc_macro_invoke_ss3, else: @esc_macro_invoke
+    buffer |> draw(pos_op, {x, y}) |> append_bytes(esc <> <<code>> <> @esc_codeset_restore)
+  end
+
   def draw(buffer, command, points) when is_list(points) do
     buffer
     |> append_byte(command)
