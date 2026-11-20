@@ -139,6 +139,7 @@ defmodule TelidrawTranspiler.Compiler do
   defp compile_statement(%{type: :if} = i, state), do: compile_if(i, state)
   defp compile_statement(%{type: :proc_decl}, state), do: state
   defp compile_statement(%{type: :raw} = raw, state), do: compile_raw(raw, state)
+  defp compile_statement(%{type: :def_texture} = d, state), do: compile_def_texture(d, state)
   defp compile_statement(%{type: :directive} = d, state), do: apply_directive(d, state)
 
   defp compile_statement(%{type: :palette_alias} = pa, state) do
@@ -685,6 +686,32 @@ defmodule TelidrawTranspiler.Compiler do
 
   defp sum_deltas(origin, deltas),
     do: Enum.reduce(deltas, origin, fn {dx, dy}, {x, y} -> {x + dx, y + dy} end)
+
+  # ---- DEF TEXTURE -----------------------------------------------------------
+
+  # `def-texture <mask> { body }`: compile the body block into its own buffer through the
+  # normal emitters (so its geometry goes through NaplpsWriter.draw/mb_xy), then frame it as
+  # `84 <mask> body 85` + the code-set restore via NaplpsWriter.def_texture. The body is raw
+  # (GCU does not decode it); the drawing pen is left unchanged (a definition draws nothing).
+  defp compile_def_texture(%{mask: mask_e, body: body} = d, state) do
+    {mask_v, state} = eval(mask_e, state)
+    sub = %{state | buffer: <<>>, pen: {0.0, 0.0}, diags: []}
+    sub = Enum.reduce(body, sub, &compile_statement/2)
+    state = %{state | diags: sub.diags ++ state.diags}
+
+    case mask_byte(trunc(mask_v)) do
+      nil ->
+        add_diag(state, d, "def-texture mask must be 1-4 (masks A-D), got #{trunc(mask_v)}")
+
+      mb ->
+        %{state | buffer: NaplpsWriter.def_texture(state.buffer, mb, sub.buffer)}
+    end
+  end
+
+  # Semantic mask 1-4 -> the operand byte 'A'-'D' (0x41-0x44); a literal A-D byte also accepted.
+  defp mask_byte(m) when m in 1..4, do: 0x40 + m
+  defp mask_byte(m) when m in 0x41..0x44, do: m
+  defp mask_byte(_), do: nil
 
   # ---- expression evaluator ------------------------------------------------
 

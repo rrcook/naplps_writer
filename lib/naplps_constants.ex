@@ -78,6 +78,15 @@ defmodule NaplpsConstants do
       @cmd_shift_in     0x0f
       @cmd_shift_out    0x0e
 
+      # C1 control set (0x80-0x9F). DEF TEXTURE defines a texture mask (A-D); END terminates
+      # a definition. (DEF MACRO 0x80 / DEFP 0x81 / DEFT 0x82 are todoelixir step 3.)
+      @cmd_def_texture  0x84
+      @cmd_end          0x85
+
+      # GCU's post-definition code-set restore (escape record 3, DS:8B7E[3]): ESC ) W ESC ~.
+      # Emitted after a DEF TEXTURE body (src/naplps_write.c o0ec3 case 0x84 -> o092f(w, 3)).
+      @esc_codeset_restore <<0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+
       #From the GCU/Prodigy palette
       @color_black           0xC0
       @color_red             0xC4

@@ -289,4 +289,42 @@ defmodule TelidrawTranspilerTest do
       assert bare(src) == <<0xA4>> <> :binary.list_to_bin(pt) <> <<0xB5>> <> zero
     end
   end
+
+  describe "def-texture (DEF TEXTURE mask definition)" do
+    test "frames 84 <mask> <body> 85 + code-set restore; body geometry via mb_xy" do
+      # mask 1 -> 'A' (0x41). Body: move (A4 + vertex) then rect (B1 + vertex).
+      body =
+        NaplpsWriter.draw(<<>>, 0xA4, {1 / 256, 1 / 256})
+        |> NaplpsWriter.draw(0xB1, {2 / 256, 2 / 256})
+
+      expected = <<0x84, 0x41>> <> body <> <<0x85, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+      assert bare("def-texture 1 { move 1/256 1/256 rect 2/256 2/256 }") == expected
+    end
+
+    test "masks 1-4 map to the operand bytes A-D" do
+      for {n, byte} <- [{1, 0x41}, {2, 0x42}, {3, 0x43}, {4, 0x44}] do
+        assert <<0x84, ^byte, 0x85, 0x1B, 0x29, 0x57, 0x1B, 0x7E>> =
+                 bare("def-texture #{n} { }")
+      end
+    end
+
+    test "an empty body still emits the definition framing" do
+      assert bare("def-texture 2 { }") == <<0x84, 0x42, 0x85, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+    end
+
+    test "a mask outside 1-4 is diagnosed and emits nothing" do
+      assert {:error, diags} = TelidrawTranspiler.transpile("def-texture 5 { }", init: false)
+      assert Enum.any?(diags, &(&1.message =~ "mask must be 1-4"))
+    end
+
+    test "the definition leaves the drawing pen unchanged" do
+      # move to (0.5,0.5), define a mask, then a polygon at (0.5,0.5): the polygon's first
+      # relative delta must still be zero (the def-texture body did not move the outer pen).
+      zero = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+      bytes = bare("move 0.5 0.5\ndef-texture 1 { move 0.1 0.1 }\npolygon 0.5 0.5")
+      assert <<0xA4, _::binary-size(3), 0x84, 0x41, _::binary-size(4), 0x85,
+               0x1B, 0x29, 0x57, 0x1B, 0x7E, 0xB5, rest::binary>> = bytes
+      assert rest == zero
+    end
+  end
 end

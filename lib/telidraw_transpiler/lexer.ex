@@ -51,6 +51,7 @@ defmodule TelidrawTranspiler.Lexer do
     "color" => :color,
     "set-color" => :set_color,
     "texture" => :texture,
+    "def-texture" => :def_texture,
     "domain" => :domain,
     "blink" => :blink,
     "wait" => :wait,

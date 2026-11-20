@@ -106,6 +106,7 @@ defmodule TelidrawTranspiler.Parser do
       kind == :let -> parse_let(toks)
       kind == :directive -> parse_directive(toks)
       kind == :raw -> parse_raw_statement(toks)
+      kind == :def_texture -> parse_def_texture(toks)
       MapSet.member?(@command_verbs, kind) -> parse_command_call(toks)
       kind == :identifier -> parse_identifier_statement(toks, tok)
       true -> throw_error(tok, "Expected a statement, got '#{tok.lexeme}'")
@@ -185,6 +186,15 @@ defmodule TelidrawTranspiler.Parser do
     }
 
     {node, rest}
+  end
+
+  # `def-texture <mask> { body }` — a DEF TEXTURE mask definition (mask 1-4 = A-D). The body
+  # is a block of drawing commands whose emitted bytes become the raw mask definition.
+  defp parse_def_texture(toks) do
+    {tok, rest} = expect(toks, :def_texture)
+    {mask, rest} = parse_expression(rest)
+    {body, rest} = parse_block(rest)
+    {%{type: :def_texture, mask: mask, body: body, line: tok.line, col: tok.col}, rest}
   end
 
   defp parse_exprs_until_block([%Token{kind: :lbrace} | _] = toks, acc),

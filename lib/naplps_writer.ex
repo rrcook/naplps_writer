@@ -109,6 +109,21 @@ defmodule NaplpsWriter do
     buffer <> <<@cmd_select_color, color>>
   end
 
+  @doc """
+  Append a DEF TEXTURE mask definition: `84 <mask> <body> 85` followed by GCU's code-set
+  restore escape (`ESC ) W ESC ~`). `mask` is the mask byte `0x41..0x44` (A-D); `body` is the
+  raw mask-definition bytes, emitted verbatim (GCU does not decode the body). Geometry for the
+  body is authored with `draw/3` / `mb_xy/2` and passed in here. An operand outside A-D defines
+  nothing in GCU; this function requires a valid mask byte (the Telidraw compiler validates the
+  semantic 1-4 form and diagnoses anything else).
+
+      iex> NaplpsWriter.def_texture(<<>>, 0x41, <<0xA4, 0xC0, 0xC0, 0xC9>>)
+      <<0x84, 0x41, 0xA4, 0xC0, 0xC0, 0xC9, 0x85, 0x1B, 0x29, 0x57, 0x1B, 0x7E>>
+  """
+  def def_texture(buffer, mask, body) when mask in 0x41..0x44 and is_binary(body) do
+    buffer <> <<@cmd_def_texture, mask>> <> body <> <<@cmd_end>> <> @esc_codeset_restore
+  end
+
   def draw(buffer, command, points) when is_list(points) do
     buffer
     |> append_byte(command)
