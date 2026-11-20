@@ -124,6 +124,21 @@ defmodule NaplpsWriter do
     buffer <> <<@cmd_def_texture, mask>> <> body <> <<@cmd_end>> <> @esc_codeset_restore
   end
 
+  @doc """
+  Append a DEF MACRO definition: `80 <code> <body> A5 85`. `code` is the macro code
+  (`0x20..0x7F`, 96 slots); `body` is the re-encoded drawing commands of the macro body (authored
+  with `draw/3` / `mb_xy/2`), emitted verbatim. GCU frames the blob with a trailing `A5` (POINT SET
+  REL, no operand) before the `85` END, and saves DEFP (`0x81`) / DEFT (`0x82`) definitions as a
+  plain `0x80`. A body that draws nothing makes no object in GCU; this function requires a
+  non-empty body (the Telidraw compiler skips emission for an empty body).
+
+      iex> NaplpsWriter.def_macro(<<>>, 0x20, <<0xA4, 0xC0, 0xC0, 0xC9>>)
+      <<0x80, 0x20, 0xA4, 0xC0, 0xC0, 0xC9, 0xA5, 0x85>>
+  """
+  def def_macro(buffer, code, body) when code in 0x20..0x7F and is_binary(body) and body != <<>> do
+    buffer <> <<@cmd_def_macro, code>> <> body <> <<0xA5, @cmd_end>>
+  end
+
   def draw(buffer, command, points) when is_list(points) do
     buffer
     |> append_byte(command)

@@ -77,6 +77,8 @@ defmodule TelidrawTranspiler.Compiler do
       vars: %{},
       aliases: %{},
       procs: %{},
+      macros: %{},
+      next_code: 0x20,
       color: 7,
       coord_mode: :fractions,
       dw: 256,
@@ -137,6 +139,7 @@ defmodule TelidrawTranspiler.Compiler do
   defp compile_statement(%{type: :repeat} = r, state), do: compile_repeat(r, state)
   defp compile_statement(%{type: :for} = f, state), do: compile_for(f, state)
   defp compile_statement(%{type: :if} = i, state), do: compile_if(i, state)
+  defp compile_statement(%{type: :proc_decl, macro: true} = p, state), do: compile_macro_def(p, state)
   defp compile_statement(%{type: :proc_decl}, state), do: state
   defp compile_statement(%{type: :raw} = raw, state), do: compile_raw(raw, state)
   defp compile_statement(%{type: :def_texture} = d, state), do: compile_def_texture(d, state)
@@ -686,6 +689,48 @@ defmodule TelidrawTranspiler.Compiler do
 
   defp sum_deltas(origin, deltas),
     do: Enum.reduce(deltas, origin, fn {dx, dy}, {x, y} -> {x + dx, y + dy} end)
+
+  # ---- DEF MACRO -------------------------------------------------------------
+
+  # `@macro proc name(params) [code] { body }`: a macro definition. The body is compiled into its
+  # own buffer through the normal emitters (the re-encoded drawing commands, via draw/mb_xy — not
+  # the recorded source), then framed as `80 <code> body A5 85` via NaplpsWriter.def_macro. GCU
+  # saves DEFP/DEFT as a plain 0x80 too. A body that draws nothing makes no object (skip emission),
+  # but the macro is still registered so a call resolves its code (invocation is step 4). Params are
+  # bound to 0 for the definition's concrete geometry; the code is explicit or auto-assigned from
+  # 0x20 (96 slots, 0x20-0x7F).
+  defp compile_macro_def(%{name: name, params: params, body: body, code: code_e} = p, state) do
+    {code, state} = macro_code(code_e, state)
+    bindings = Map.new(params, fn pn -> {pn, 0} end)
+    sub = %{state | buffer: <<>>, pen: {0.0, 0.0}, vars: Map.merge(state.vars, bindings), diags: []}
+    sub = Enum.reduce(body, sub, &compile_statement/2)
+    state = %{state | diags: sub.diags ++ state.diags}
+
+    cond do
+      code == nil ->
+        add_diag(state, p, "macro code must be 0x20-0x7F (32-127)")
+
+      sub.buffer == <<>> ->
+        # GCU: a body that draws nothing makes no DEF MACRO object; still register the name.
+        %{state | macros: Map.put(state.macros, name, code), next_code: code + 1}
+
+      true ->
+        %{
+          state
+          | buffer: NaplpsWriter.def_macro(state.buffer, code, sub.buffer),
+            macros: Map.put(state.macros, name, code),
+            next_code: code + 1
+        }
+    end
+  end
+
+  defp macro_code(nil, state), do: {state.next_code, state}
+
+  defp macro_code(expr, state) do
+    {v, state} = eval(expr, state)
+    c = trunc(v)
+    if c in 0x20..0x7F, do: {c, state}, else: {nil, state}
+  end
 
   # ---- DEF TEXTURE -----------------------------------------------------------
 

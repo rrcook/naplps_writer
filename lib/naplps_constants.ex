@@ -78,8 +78,12 @@ defmodule NaplpsConstants do
       @cmd_shift_in     0x0f
       @cmd_shift_out    0x0e
 
-      # C1 control set (0x80-0x9F). DEF TEXTURE defines a texture mask (A-D); END terminates
-      # a definition. (DEF MACRO 0x80 / DEFP 0x81 / DEFT 0x82 are todoelixir step 3.)
+      # C1 control set (0x80-0x9F). DEF MACRO / DEFP / DEFT define a macro (code 0x20-0x7F);
+      # GCU saves all three as a plain DEF MACRO (0x80). DEF TEXTURE defines a texture mask (A-D);
+      # END terminates a definition.
+      @cmd_def_macro    0x80
+      @cmd_defp_macro   0x81
+      @cmd_deft_macro   0x82
       @cmd_def_texture  0x84
       @cmd_end          0x85
 

@@ -136,6 +136,12 @@ defmodule TelidrawTranspiler.Parser do
     {_, rest} = expect(rest, :lparen)
     {params, rest} = parse_params(rest)
     {_, rest} = expect(rest, :rparen)
+    # A macro may carry an explicit code (0x20-0x7F) before the block; otherwise it is auto-assigned.
+    {code, rest} =
+      case rest do
+        [%Token{kind: :lbrace} | _] -> {nil, rest}
+        _ -> parse_expression(rest)
+      end
     {body, rest} = parse_block(rest)
 
     node = %{
@@ -144,6 +150,7 @@ defmodule TelidrawTranspiler.Parser do
       params: params,
       body: body,
       macro: as_macro,
+      code: code,
       line: line,
       col: col
     }

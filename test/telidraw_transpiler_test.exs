@@ -327,4 +327,42 @@ defmodule TelidrawTranspilerTest do
       assert rest == zero
     end
   end
+
+  describe "@macro proc (DEF MACRO definition)" do
+    test "emits 80 <code> <body> A5 85; body geometry via mb_xy; auto code 0x20" do
+      body = NaplpsWriter.draw(<<>>, 0xA4, {1 / 256, 1 / 256})
+      expected = <<0x80, 0x20>> <> body <> <<0xA5, 0x85>>
+      assert bare("@macro proc star() { move 1/256 1/256 }") == expected
+    end
+
+    test "auto-assigns sequential codes from 0x20" do
+      bytes = bare("@macro proc a() { move 0 0 }\n@macro proc b() { move 0 0 }")
+      assert <<0x80, 0x20, _::binary-size(4), 0xA5, 0x85,
+               0x80, 0x21, _::binary-size(4), 0xA5, 0x85>> = bytes
+    end
+
+    test "an explicit code is honored" do
+      assert <<0x80, 0x41, _::binary-size(4), 0xA5, 0x85>> =
+               bare("@macro proc m() 65 { move 0 0 }")
+    end
+
+    test "a body that draws nothing makes no object" do
+      assert bare("@macro proc empty() { }") == <<>>
+    end
+
+    test "params are bound (to 0) for the definition's concrete geometry" do
+      body = NaplpsWriter.draw(<<>>, 0xA4, {0.0, 0.0})
+      assert bare("@macro proc m(x) { move x x }") == <<0x80, 0x20>> <> body <> <<0xA5, 0x85>>
+    end
+
+    test "an out-of-range code is diagnosed" do
+      assert {:error, diags} =
+               TelidrawTranspiler.transpile("@macro proc m() 200 { move 0 0 }", init: false)
+      assert Enum.any?(diags, &(&1.message =~ "macro code must be"))
+    end
+
+    test "a plain proc is inlined, not emitted as a macro" do
+      assert bare("proc p() { move 0 0 }\np") == NaplpsWriter.draw(<<>>, 0xA4, {0.0, 0.0})
+    end
+  end
 end
