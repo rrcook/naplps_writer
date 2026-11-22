@@ -69,4 +69,38 @@ defmodule NaplpsWriterTest do
                NaplpsWriter.macro_call(<<0xBE, 0xD0>>, 0x20, {0.0, 0.0})
     end
   end
+
+  describe "serialize_text/2 (GCU text-blob suppression)" do
+    test "drops NULs" do
+      {bytes, _} = NaplpsWriter.serialize_text(<<"a", 0x00, "b">>)
+      assert bytes == "ab"
+    end
+
+    test "reverse video 88/89 emitted only on state change" do
+      {bytes, _} = NaplpsWriter.serialize_text(<<0x88, "x", 0x88, 0x89, 0x89, 0x88>>)
+      assert bytes == <<0x88, "x", 0x89, 0x88>>
+    end
+
+    test "underline 99/9A emitted only on state change" do
+      {bytes, _} = NaplpsWriter.serialize_text(<<0x99, 0x99, 0x9A, 0x9A>>)
+      assert bytes == <<0x99, 0x9A>>
+    end
+
+    test "SI only after an ESC" do
+      {bytes, _} = NaplpsWriter.serialize_text(<<0x0F, "a", 0x1B, 0x0F, 0x0F>>)
+      assert bytes == <<"a", 0x1B, 0x0F>>
+    end
+
+    test "state persists across calls" do
+      {b1, st} = NaplpsWriter.serialize_text(<<0x88>>)
+      {b2, _} = NaplpsWriter.serialize_text(<<0x88, 0x89>>, st)
+      assert b1 == <<0x88>>
+      assert b2 == <<0x89>>
+    end
+
+    test "printable text and other controls pass through" do
+      {bytes, _} = NaplpsWriter.serialize_text(<<"Hi", 0x0D, 0x0A, 0x86>>)
+      assert bytes == <<"Hi", 0x0D, 0x0A, 0x86>>
+    end
+  end
 end

@@ -51,7 +51,8 @@ let center = (x + 0.1) * 2   // arithmetic
 | `polygon-outline x1 y1 ...` | PolygonOutlined   |                                  |
 | `polygon-set sx sy v1x v1y ...` | PolygonSetFilled | absolute start, then absolute verts |
 | `polygon-set abs sx sy dx1 dy1 ...` | PolygonSetFilled | exact form: start abs + relative tail |
-| `text "..."`           | AsciiCharCommand seq   | ASCII string                      |
+| `text "..."`           | AsciiCharCommand seq   | ASCII string (printable only)     |
+| `text-raw "..."`       | text blob with controls | raw bytes incl. C0/C1; see Text controls |
 
 ## Attributes 🎛️
 
@@ -93,6 +94,30 @@ for i in 0..7 {
   rect (1/8) 0.1
 }
 ```
+
+## Text controls 🔤
+
+`text` emits printable ASCII only (anything else is filtered out). To put NAPLPS control codes inside
+text — CR/LF, reverse video, underline, REPEAT, and so on — use `text-raw` and write the bytes as `\xHH`
+escapes (two hex digits; any byte value, including C1 codes `0x80`–`0x9F`):
+
+```td
+move 0.1 0.6
+text-raw "\x88Warning\x89 line one\x0D\x0Aline two"   // reverse video on/off, then CR LF
+text-raw "\x99underlined\x9A"
+```
+
+`text-raw` takes the same optional `[width height]` size arguments as `text` and does not move the pen.
+Its bytes pass through GCU's text serializer rules:
+
+- NUL (`\x00`) is dropped.
+- Reverse video `\x88`/`\x89` and underline `\x99`/`\x9A` are written only when they change state, so a
+  repeated "on" (or "off") is dropped. The state carries across `text-raw` commands.
+- SI (`\x0F`) is written only right after an ESC (`\x1B`).
+- Everything else is copied as is.
+
+`\xHH` escapes work in any string literal; string literals are byte strings, so a `\x88` is the single
+byte `0x88`.
 
 ## Definitions: texture masks and macros 🧩
 

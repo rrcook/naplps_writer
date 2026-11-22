@@ -37,6 +37,7 @@ defmodule TelidrawTranspiler.Parser do
                    :point,
                    :point_rel,
                    :text,
+                   :text_raw,
                    :color,
                    :set_color,
                    :texture,

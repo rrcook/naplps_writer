@@ -118,6 +118,8 @@ defmodule NaplpsConstants do
       @hatching_solid        0xC0
       @hatching_vertical     0xC8
 
+      @gr_reverse_video_on   0x88
+      @gr_reverse_video_off  0x89
       @gr_word_wrap_on       0x95
       @gr_word_wrap_off      0x96
       @gr_scroll_on          0x97

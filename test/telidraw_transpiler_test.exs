@@ -121,6 +121,39 @@ defmodule TelidrawTranspilerTest do
     end
   end
 
+  describe "text-raw (control-bearing text)" do
+    test "preserves C1 controls authored via \\xHH escapes" do
+      assert bare(~S|text-raw "\x88hi\x89"|) == <<0x88, "hi", 0x89>>
+    end
+
+    test "preserves CR/LF and REPEAT" do
+      assert bare(~S|text-raw "a\x0Db\x0Ac\x86"|) == <<"a", 0x0D, "b", 0x0A, "c", 0x86>>
+    end
+
+    test "suppresses redundant toggles (GCU serializer)" do
+      assert bare(~S|text-raw "\x88\x88x\x89\x89"|) == <<0x88, "x", 0x89>>
+    end
+
+    test "toggle state persists across text-raw commands" do
+      src = ~S|text-raw "\x88a"
+text-raw "\x88b\x89"|
+      assert bare(src) == <<0x88, "a", "b", 0x89>>
+    end
+
+    test "does not move the pen" do
+      src = ~S|move 0.5 0.5
+text-raw "\x88hi\x89"
+polygon 0.5 0.5|
+      zero = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+      assert <<0xA4, _::binary-size(3), 0x88, "hi", 0x89, 0xB5, rest::binary>> = bare(src)
+      assert rest == zero
+    end
+
+    test "plain text still filters non-printable" do
+      assert bare(~s|text "a\tb"|) == "ab"
+    end
+  end
+
   describe "control flow expansion" do
     test "repeat unrolls the body" do
       assert bare("repeat 3 { color 1 }") == bare("color 1\ncolor 1\ncolor 1")

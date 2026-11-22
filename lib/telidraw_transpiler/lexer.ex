@@ -48,6 +48,7 @@ defmodule TelidrawTranspiler.Lexer do
     "point" => :point,
     "point-rel" => :point_rel,
     "text" => :text,
+    "text-raw" => :text_raw,
     "color" => :color,
     "set-color" => :set_color,
     "texture" => :texture,
@@ -203,13 +204,20 @@ defmodule TelidrawTranspiler.Lexer do
 
   defp read_string([], acc, sline, scol, _line, _col, toks, diags) do
     diags = [diag(:error, sline, scol, "Unterminated string literal") | diags]
-    tok = %Token{kind: :string, lexeme: rev_to_string(acc), line: sline, col: scol}
+    tok = %Token{kind: :string, lexeme: rev_to_bytes(acc), line: sline, col: scol}
     scan([], sline, scol, [tok | toks], diags)
   end
 
   defp read_string([?" | rest], acc, sline, scol, line, col, toks, diags) do
-    tok = %Token{kind: :string, lexeme: rev_to_string(acc), line: sline, col: scol}
+    tok = %Token{kind: :string, lexeme: rev_to_bytes(acc), line: sline, col: scol}
     scan(rest, line, col + 1, [tok | toks], diags)
+  end
+
+  defp read_string([?\\, ?x, h1, h2 | rest], acc, sline, scol, line, col, toks, diags)
+       when (h1 in ?0..?9 or h1 in ?a..?f or h1 in ?A..?F) and
+            (h2 in ?0..?9 or h2 in ?a..?f or h2 in ?A..?F) do
+    byte = hex_val(h1) * 16 + hex_val(h2)
+    read_string(rest, [byte | acc], sline, scol, line, col + 4, toks, diags)
   end
 
   defp read_string([?\\, esc | rest], acc, sline, scol, line, col, toks, diags) do
@@ -355,8 +363,14 @@ defmodule TelidrawTranspiler.Lexer do
     do: %{severity: sev, line: line, column: col, message: msg}
 
   defp rev_to_string(acc), do: acc |> Enum.reverse() |> List.to_string()
+  # String literals are NAPLPS bytes (raw), not Unicode text: \xHH escapes insert byte values
+  # >= 0x80 that List.to_string would UTF-8-encode. ASCII source is identical either way.
+  defp rev_to_bytes(acc), do: acc |> Enum.reverse() |> :binary.list_to_bin()
 
   defp digit?(c), do: c >= ?0 and c <= ?9
+  defp hex_val(c) when c >= ?0 and c <= ?9, do: c - ?0
+  defp hex_val(c) when c >= ?a and c <= ?f, do: c - ?a + 10
+  defp hex_val(c) when c >= ?A and c <= ?F, do: c - ?A + 10
   defp letter?(c), do: (c >= ?a and c <= ?z) or (c >= ?A and c <= ?Z)
   defp ident_start?(c), do: letter?(c) or c == ?_
   defp ident_part?(c), do: letter?(c) or digit?(c) or c == ?_

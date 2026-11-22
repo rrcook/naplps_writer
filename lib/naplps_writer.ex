@@ -187,4 +187,39 @@ defmodule NaplpsWriter do
     default_text_buffer = <<@cmd_text_attr, 0xF0, 0xC0>>
     buffer <> default_text_buffer <> text_size_buffer
   end
+
+  @doc """
+  Serialize a text blob the way GCU's writer does (`src/naplps_write.c` `r25c68`, I 0x25c68):
+  NULs dropped; an SI (`0x0F`) only follows an ESC; reverse video (`0x88`/`0x89`) and underline
+  (`0x99`/`0x9A`) are emitted only when they change state; everything else is copied. Returns
+  `{filtered_bytes, new_state}`; `state` tracks `reverse_video` / `underline` (whether each mode is
+  currently on) and `esc_seen` across calls (GCU keeps these writer-global, as `tog88` / `tog99` /
+  `esc_seen`). SELECT COLOR sequences are copied verbatim here (GCU also diffs them against
+  the last graphic colour — a refinement tied to the attribute reference table).
+
+      iex> {bytes, _} = NaplpsWriter.serialize_text(<<0x88, 0x88, 0x89, 0x89>>)
+      iex> bytes
+      <<0x88, 0x89>>
+  """
+  def serialize_text(text, state \\ %{reverse_video: false, underline: false, esc_seen: false})
+      when is_binary(text) do
+    {rev, state} =
+      Enum.reduce(:binary.bin_to_list(text), {[], state}, fn c, {acc, st} ->
+        {emit, st} =
+          case c do
+            0x00 -> {false, st}
+            0x1B -> {true, %{st | esc_seen: true}}
+            @cmd_shift_in -> {st.esc_seen, %{st | esc_seen: false}}
+            @gr_reverse_video_on -> {not st.reverse_video, %{st | reverse_video: true}}
+            @gr_reverse_video_off -> {st.reverse_video, %{st | reverse_video: false}}
+            @gr_underline_start -> {not st.underline, %{st | underline: true}}
+            @gr_underline_stop -> {st.underline, %{st | underline: false}}
+            _ -> {true, st}
+          end
+
+        {if(emit, do: [c | acc], else: acc), st}
+      end)
+
+    {rev |> Enum.reverse() |> :binary.list_to_bin(), state}
+  end
 end

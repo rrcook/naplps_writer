@@ -80,6 +80,7 @@ defmodule TelidrawTranspiler.Compiler do
       macros: %{},
       next_code: 0x20,
       first_positioned: true,
+      text_state: %{reverse_video: false, underline: false, esc_seen: false},
       color: 7,
       coord_mode: :fractions,
       dw: 256,
@@ -266,6 +267,9 @@ defmodule TelidrawTranspiler.Compiler do
 
       :text ->
         emit_text(c, state)
+
+      :text_raw ->
+        emit_text_raw(c, state)
 
       :close ->
         # No-op: the reference compiler does not track polygon paths.
@@ -507,6 +511,26 @@ defmodule TelidrawTranspiler.Compiler do
 
   defp emit_text(c, state),
     do: add_diag(state, c, "text expects a string literal as first arg")
+
+  # `text-raw "..." [width height]`: like `text`, but the string keeps its C0/C1 control codes
+  # (authored via \xHH escapes) and is serialized the way GCU's writer does — NULs dropped,
+  # redundant reverse-video/underline/SI toggles suppressed (NaplpsWriter.serialize_text). The
+  # toggle state persists across text commands (GCU keeps it writer-global). No pen move.
+  defp emit_text_raw(%{args: [%{type: :str, value: s} | rest]}, state) do
+    state =
+      if length(rest) >= 2 do
+        {[w, h], state} = eval_all(Enum.take(rest, 2), state)
+        %{state | buffer: NaplpsWriter.text_attributes(state.buffer, {w, h})}
+      else
+        state
+      end
+
+    {filtered, tstate} = NaplpsWriter.serialize_text(s, state.text_state)
+    %{state | buffer: NaplpsWriter.draw_text_raw(state.buffer, filtered), text_state: tstate}
+  end
+
+  defp emit_text_raw(c, state),
+    do: add_diag(state, c, "text-raw expects a string literal as first arg")
 
   # ---- with / repeat / for / if / proc -------------------------------------
 
