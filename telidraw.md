@@ -113,7 +113,8 @@ Its bytes pass through GCU's text serializer rules:
 - NUL (`\x00`) is dropped.
 - Reverse video `\x88`/`\x89` and underline `\x99`/`\x9A` are written only when they change state, so a
   repeated "on" (or "off") is dropped. The state carries across `text-raw` commands.
-- SI (`\x0F`) is written only right after an ESC (`\x1B`).
+- SI (`\x0F`) is written only right after an ESC (`\x1B`). A file starts as if an ESC had just been seen
+  (GCU's starting state), so an SI before any ESC is kept.
 - Everything else is copied as is.
 
 `\xHH` escapes work in any string literal; string literals are byte strings, so a `\x88` is the single
@@ -134,7 +135,9 @@ def-texture 1 {
 }
 ```
 
-A mask outside 1–4 is a compile error (GCU defines nothing for an operand other than A–D).
+A mask outside 1–4 is a compile error (GCU defines nothing for an operand other than A–D). When the
+definition ends, the drawing point goes back to (0,0), as GCU does, so relative drawing after a
+`def-texture` starts from the origin; `move` first if you want to draw somewhere else.
 
 ### Macros
 
@@ -145,8 +148,7 @@ with `@name`.
 
 ```td
 @macro proc star() {
-  move 0 0
-  line-rel 1/16 1/16
+  line-rel 1/16 1/16       // relative moves, so the star is drawn wherever the pen is
   line-rel -1/16 1/16
 }
 
@@ -158,11 +160,20 @@ move 0.6 0.2
 
 - `@macro proc name(params) [code] { … }` — definition. Params are bound for the body's geometry; an
   explicit `code` (32–127) overrides the auto-assigned one. A body that draws nothing makes no object.
-  DEFP/DEFT variants are saved as a plain DEF MACRO (`0x80`), as in GCU.
+  DEFP/DEFT variants are saved as a plain DEF MACRO (`0x80`), as in GCU. Defining a macro does not
+  move the pen (the body is recorded, not drawn).
 - `@name args` — invocation at the current pen: a position command (`A4` absolute for the first
   positioned object, `A5` pen-relative afterwards), the invocation escape `ESC / z ESC o`, the code
   byte, and the code-set restore `ESC ) W ESC ~`. Arguments are accepted but do not change the replayed
-  body (GCU plays the recorded definition). An undefined macro is a compile error.
+  body (GCU plays the recorded definition). An undefined macro is a compile error. After the call the
+  pen is wherever playing the body leaves it, so relative drawing continues from the end of the
+  macro's drawing. An absolute `move` inside a body makes the macro draw at that fixed position, not at
+  the pen.
+- **Calling a macro from another macro's body plays the inner macro twice in GCU.** GCU runs a
+  definition while it records it, and it records the bytes the inner call plays as well as the call
+  itself, so replaying the outer macro draws the inner one via the call and again from the copy.
+- Definitions cannot be nested: `@macro proc` or `def-texture` inside a macro or texture body is a
+  compile error, because GCU ends the outer definition at the inner one's opcode.
 
 ## Raw fallback
 

@@ -64,10 +64,14 @@ bytes = TelidrawTranspiler.transpile!(source)
 * `transpile!/2` → returns the binary directly or raises
   `TelidrawTranspiler.Error`.
 
-**Option:** `:init` (default `true`) prepends `NaplpsWriter.gcu_init/0`, which
+**Options:** `:init` (default `true`) prepends `NaplpsWriter.gcu_init/0`, which
 sets up the graphics environment (domain, texture, shift-in) so the output is a
 self-contained, drawable NAPLPS picture. Pass `init: false` to emit only the
-bytes produced by the source commands.
+bytes produced by the source commands. `:terminate` (default: the value of
+`:init`) appends `A5`, the byte GCU ends every file with (`NaplpsWriter.gcu_end/1`).
+Without it, GCU reads the end of the file as the last command's final operand
+(a trailing LINE REL gains a bogus vertex), so complete files get it and
+`init: false` fragments stay bare.
 
 ### Language coverage
 

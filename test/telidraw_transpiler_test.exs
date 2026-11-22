@@ -100,9 +100,9 @@ defmodule TelidrawTranspilerTest do
       assert bare("texture 1 1 2") == <<0xA3, 0xD5>>
     end
 
-    test "wait uses the mandated 0x5C fixed byte" do
-      # interval byte = 0xC0 | 10 = 0xCA
-      assert bare("wait 10") == <<0xBD, 0x5C, 0xCA>>
+    test "wait uses GCU's 0xDC fixed byte (1011100 with bit 8 set, as GCU writes it)" do
+      # interval byte = 0xC0 | 10 = 0xCA; TITLE.PAG (GCU-written) ends `bd dc ca a5`
+      assert bare("wait 10") == <<0xBD, 0xDC, 0xCA>>
     end
 
     test "reset and nsr" do
@@ -151,6 +151,10 @@ polygon 0.5 0.5|
 
     test "plain text still filters non-printable" do
       assert bare(~s|text "a\tb"|) == "ab"
+    end
+
+    test "a leading SI is kept (GCU starts each save as if an ESC had been seen)" do
+      assert bare(~S|text-raw "\x0Fab"|) == <<0x0F, "ab">>
     end
   end
 
@@ -350,14 +354,14 @@ polygon 0.5 0.5|
       assert Enum.any?(diags, &(&1.message =~ "mask must be 1-4"))
     end
 
-    test "the definition leaves the drawing pen unchanged" do
-      # move to (0.5,0.5), define a mask, then a polygon at (0.5,0.5): the polygon's first
-      # relative delta must still be zero (the def-texture body did not move the outer pen).
-      zero = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+    test "the definition resets the drawing pen to (0,0), as GCU's decoder does" do
+      # move to (0.5,0.5), define a mask, then a polygon at (0.5,0.5). GCU puts the drawing point
+      # back at (0,0) when DEF TEXTURE ends (measured under emulation), so the polygon's first
+      # relative delta must be (0.5,0.5) for its vertex to land at (0.5,0.5).
       bytes = bare("move 0.5 0.5\ndef-texture 1 { move 0.1 0.1 }\npolygon 0.5 0.5")
       assert <<0xA4, _::binary-size(3), 0x84, 0x41, _::binary-size(4), 0x85,
                0x1B, 0x29, 0x57, 0x1B, 0x7E, 0xB5, rest::binary>> = bytes
-      assert rest == zero
+      assert rest == NaplpsWriter.mb_xy(<<>>, {0.5, 0.5})
     end
   end
 
@@ -432,6 +436,94 @@ polygon 0.5 0.5|
                0xA4, _::binary-size(3), 0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E,
                0xA5, _::binary-size(3), 0x1B, 0x2F, 0x7A, 0x1B, 0x6F, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E>> =
                bytes
+    end
+  end
+
+  # The pen after a macro call is where playing the body leaves it (GCU, measured under
+  # emulation: a LINE REL body moves the drawing point by its delta). Each case ends with a
+  # polygon whose first vertex is absolute; its encoded delta = vertex - pen, so the tail of the
+  # output checks the pen. All values are n/256, exact in the 3-byte encoding.
+  describe "pen after a macro call" do
+    defp ends_with_polygon_delta(bytes, {dx, dy}) do
+      tail = <<0xB5>> <> NaplpsWriter.mb_xy(<<>>, {dx / 256, dy / 256})
+      binary_part(bytes, byte_size(bytes) - byte_size(tail), byte_size(tail)) == tail
+    end
+
+    test "a LINE REL body moves the pen by its delta" do
+      src = "move 64/256 64/256\n@macro proc m() { line-rel 16/256 16/256 }\n@m\npolygon 128/256 128/256"
+      # pen after the call = (80,80) -> delta (48,48)
+      assert ends_with_polygon_delta(bare(src), {48, 48})
+    end
+
+    test "defining a macro does not move the pen (the body is recorded, not run)" do
+      src = "move 64/256 64/256\n@macro proc m() { line-rel 16/256 16/256 }\npolygon 128/256 128/256"
+      assert ends_with_polygon_delta(bare(src), {64, 64})
+    end
+
+    test "a RECT body advances the pen by the width" do
+      src = "@macro proc m() { rect 16/256 8/256 }\nmove 64/256 64/256\n@m\npolygon 128/256 128/256"
+      # pen after the call = (80,64) -> delta (48,64)
+      assert ends_with_polygon_delta(bare(src), {48, 64})
+    end
+
+    test "a nested call plays the inner macro twice, as GCU does" do
+      # GCU decodes a definition while recording it, so defining b plays a and records a's bytes
+      # after the call (GCU's macro store for b: call 20, then a's a9c0d2c0a5, then the rest).
+      # Playing b then runs a via the call and again from the copy.
+      src = """
+      move 0 0
+      @macro proc a() { line-rel 16/256 16/256 }
+      @macro proc b() {
+        @a
+        line-rel 16/256 0
+      }
+      move 64/256 64/256
+      @b
+      polygon 128/256 128/256
+      """
+      # (64,64) -> a: (80,80) -> copy of a: (96,96) -> line-rel: (112,96) -> delta (16,32)
+      assert ends_with_polygon_delta(bare(src), {16, 32})
+    end
+  end
+
+  # GCU ends a macro or texture definition at any C1 0x80-0x85, so a definition inside another
+  # one would cut the outer short (measured: macro 0x21 with a DEF TEXTURE inside keeps only the
+  # bytes before it, and the rest is drawn at top level).
+  describe "definitions cannot nest" do
+    for {label, src} <- [
+          {"def-texture inside a macro", "@macro proc m() {\nline-rel 1/256 1/256\ndef-texture 1 { }\n}"},
+          {"a macro inside a macro", "@macro proc m() {\n@macro proc n() { move 0 0 }\n}"},
+          {"a macro inside def-texture", "def-texture 1 {\n@macro proc n() { move 0 0 }\n}"},
+          {"def-texture inside def-texture", "def-texture 1 {\ndef-texture 2 { }\n}"}
+        ] do
+      test "#{label} is an error" do
+        assert {:error, diags} = TelidrawTranspiler.transpile(unquote(src), init: false)
+        assert Enum.any?(diags, &(&1.message =~ "cannot be nested"))
+      end
+    end
+  end
+
+  describe "end of file" do
+    test "a complete file ends with GCU's A5" do
+      {:ok, bytes} = TelidrawTranspiler.transpile("move 0.5 0.5")
+      assert bytes ==
+               NaplpsWriter.gcu_init() <> NaplpsWriter.draw(<<>>, 0xA4, {0.5, 0.5}) <> <<0xA5>>
+    end
+
+    test "an empty program is the header plus A5" do
+      assert TelidrawTranspiler.transpile!("") == NaplpsWriter.gcu_init() <> <<0xA5>>
+    end
+
+    test "init: false fragments stay bare (no A5)" do
+      assert bare("move 0.5 0.5") == NaplpsWriter.draw(<<>>, 0xA4, {0.5, 0.5})
+    end
+
+    test ":terminate overrides the default either way" do
+      assert TelidrawTranspiler.transpile!("move 0.5 0.5", terminate: false) ==
+               NaplpsWriter.gcu_init() <> NaplpsWriter.draw(<<>>, 0xA4, {0.5, 0.5})
+
+      assert TelidrawTranspiler.transpile!("move 0.5 0.5", init: false, terminate: true) ==
+               NaplpsWriter.draw(<<>>, 0xA4, {0.5, 0.5}) <> <<0xA5>>
     end
   end
 end

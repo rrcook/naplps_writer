@@ -64,11 +64,14 @@ defmodule TelidrawTranspiler.Compiler do
   @doc """
   Compile `program` (from `TelidrawTranspiler.Parser`) into `{bytes, diagnostics}`.
 
-  Options: `:init` (default `true`) prepends `NaplpsWriter.gcu_init/0`.
+  Options: `:init` (default `true`) prepends `NaplpsWriter.gcu_init/0`; `:terminate` (default: the
+  value of `:init`) appends GCU's end-of-file `A5` (`NaplpsWriter.gcu_end/1`), so a complete file ends
+  the way every GCU-written file does and fragments compiled with `init: false` stay bare.
   """
   @spec compile(map(), keyword()) :: {binary(), [map()]}
   def compile(program, opts \\ []) do
     init = Keyword.get(opts, :init, true)
+    terminate = Keyword.get(opts, :terminate, init)
     buffer = if init, do: NaplpsWriter.gcu_init(), else: <<>>
 
     state = %{
@@ -80,7 +83,10 @@ defmodule TelidrawTranspiler.Compiler do
       macros: %{},
       next_code: 0x20,
       first_positioned: true,
-      text_state: %{reverse_video: false, underline: false, esc_seen: false},
+      # true while compiling a macro or texture definition body (definitions cannot nest)
+      defining: false,
+      # GCU's text-writer state at the first text object of a save (r25c2e): modes off, esc_seen on.
+      text_state: %{reverse_video: false, underline: false, esc_seen: true},
       color: 7,
       coord_mode: :fractions,
       dw: 256,
@@ -98,8 +104,9 @@ defmodule TelidrawTranspiler.Compiler do
       end)
 
     state = Enum.reduce(program.statements, state, &compile_statement/2)
+    buffer = if terminate, do: NaplpsWriter.gcu_end(state.buffer), else: state.buffer
 
-    {state.buffer, Enum.reverse(state.diags)}
+    {buffer, Enum.reverse(state.diags)}
   end
 
   # ---- directives ----------------------------------------------------------
@@ -250,7 +257,9 @@ defmodule TelidrawTranspiler.Compiler do
 
       :wait ->
         with_n(c, 1, state, fn [t], st ->
-          emit_bytes(st, <<@op_wait, 0x5C, interval_byte(trunc(t))>>)
+          # The fixed byte is 1011100 in bits 7-1 with bit 8 set like every operand byte on an
+          # 8-bit link: 0xDC, which is what GCU stores and writes (TITLE.PAG ends `bd dc ca a5`).
+          emit_bytes(st, <<@op_wait, 0xDC, interval_byte(trunc(t))>>)
         end)
 
       :blink ->
@@ -679,42 +688,124 @@ defmodule TelidrawTranspiler.Compiler do
   # NaplpsWriter.mb_xy). Only opcodes whose normal constructor moves the pen are
   # handled; everything else is a no-op. Opcode bit 7 is stripped first so 7-bit
   # (0x20-0x7F) and 8-bit (0xA0-0xFF) presentations normalize to the same case.
-  defp update_pen_from_raw(state, opcode, operands) do
+  defp update_pen_from_raw(state, opcode, operands),
+    do: set_pen(state, pen_after_pdi(state.pen, opcode, operands))
+
+  # Where the drawing point ends after one PDI command started at `pen` (pure, so a macro body can
+  # be replayed through the same rules -- replay_pen/4).
+  defp pen_after_pdi({px, py} = pen, opcode, operands) do
     verts = decode_vertices(operands)
-    {px, py} = state.pen
 
     case opcode &&& 0x7F do
       # Absolute pen sets — pen lands exactly at the (last) decoded vertex.
       op when op in [0x24, 0x26, 0x28] and verts != [] ->
-        set_pen(state, List.last(verts))
+        List.last(verts)
 
       # LineSetAbsolute — pen ends at the last absolute vertex.
       0x2A when verts != [] ->
-        set_pen(state, List.last(verts))
+        List.last(verts)
 
       # Relative pen offsets / cumulative-relative walks — pen advances by the sum.
       op when op in [0x25, 0x27, 0x29, 0x2B, 0x34, 0x35, 0x3A, 0x3B] ->
-        set_pen(state, sum_deltas({px, py}, verts))
+        sum_deltas(pen, verts)
 
       # Arc (mid then end, both relative to pen) — pen ends at the end vertex.
       op when op in [0x2C, 0x2D] and length(verts) >= 2 ->
         [{mdx, mdy}, {edx, edy} | _] = verts
-        set_pen(state, {px + mdx + edx, py + mdy + edy})
+        {px + mdx + edx, py + mdy + edy}
 
       # ArcSet (start absolute, mid + end relative) — pen ends at start+dm+de.
       op when op in [0x2E, 0x2F] and length(verts) >= 3 ->
         [{sx, sy}, {dmx, dmy}, {dex, dey} | _] = verts
-        set_pen(state, {sx + dmx + dex, sy + dmy + dey})
+        {sx + dmx + dex, sy + dmy + dey}
+
+      # Rect runs (w,h pairs) — GCU advances the pen by each width (SUPPORTED.md 30-33), the
+      # same rule emit_rect_filled applies.
+      op when op in [0x30, 0x31] ->
+        Enum.reduce(verts, pen, fn {w, _h}, {x, y} -> {x + w, y} end)
+
+      # SetRect (start absolute, then w,h pairs) — pen = start, advanced by each width.
+      op when op in [0x32, 0x33] and verts != [] ->
+        [start | sizes] = verts
+        Enum.reduce(sizes, start, fn {w, _h}, {x, y} -> {x + w, y} end)
 
       # PolygonSet (first vertex absolute, rest relative) — pen ends at the sum.
       op when op in [0x36, 0x37] and length(verts) >= 2 ->
         [start | rels] = verts
-        set_pen(state, sum_deltas(start, rels))
+        sum_deltas(start, rels)
 
       _ ->
-        state
+        pen
     end
   end
+
+  # Where a decoder's drawing point ends after playing `bytes` (a macro's recording, see
+  # record_body/4) from `pen`. PDI commands (opcode 0xA0-0xBF plus its 0xC0-0xFF operand bytes)
+  # go through pen_after_pdi; a call (ESC / z then ESC o or SS3, then the code) plays that macro's
+  # recording. Depth-limited: GCU hangs on a macro that calls itself while it plays. Text is not
+  # modelled (the top-level text commands do not move the pen either).
+  defp replay_pen(bytes, pen, recordings, depth \\ 0)
+  defp replay_pen(<<>>, pen, _recordings, _depth), do: pen
+
+  defp replay_pen(<<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, code, rest::binary>>, pen, recs, depth),
+    do: replay_pen(rest, replay_call(code, pen, recs, depth), recs, depth)
+
+  defp replay_pen(<<0x1B, 0x2F, 0x7A, 0x1D, code, rest::binary>>, pen, recs, depth),
+    do: replay_pen(rest, replay_call(code, pen, recs, depth), recs, depth)
+
+  defp replay_pen(<<op, rest::binary>>, pen, recs, depth) when op in 0xA0..0xBF do
+    {operands, rest} = take_operands(rest, [])
+    replay_pen(rest, pen_after_pdi(pen, op, operands), recs, depth)
+  end
+
+  defp replay_pen(<<_, rest::binary>>, pen, recs, depth), do: replay_pen(rest, pen, recs, depth)
+
+  defp replay_call(code, pen, recs, depth) when depth < 16 do
+    case Map.fetch(recs, code) do
+      {:ok, recording} -> replay_pen(recording, pen, recs, depth + 1)
+      :error -> pen
+    end
+  end
+
+  defp replay_call(_code, pen, _recs, _depth), do: pen
+
+  defp take_operands(<<b, rest::binary>>, acc) when b in 0xC0..0xFF, do: take_operands(rest, [b | acc])
+  defp take_operands(rest, acc), do: {Enum.reverse(acc), rest}
+
+  # What GCU stores for a macro whose definition body is `bytes` (measured: the C reader's macro
+  # store, byte-exact with GCU's). GCU decodes a definition while it records it, so a call inside
+  # the body plays the called macro, and the bytes that playback feeds are recorded too: right
+  # after the call's code byte comes the called macro's own recording, expanded the same way.
+  # Playing the outer macro later therefore runs the inner one twice (via the call, then from the
+  # copy). The macro being defined is not played, nor is an undefined one. Recording stops at a
+  # definition opcode (C1 0x80-0x85), which ends the definition in GCU.
+  defp record_body(bytes, recs, self_code, depth \\ 0)
+  defp record_body(<<>>, _recs, _self, _depth), do: <<>>
+  defp record_body(<<op, _::binary>>, _recs, _self, _depth) when op in 0x80..0x85, do: <<>>
+
+  defp record_body(<<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, code, rest::binary>>, recs, self, depth),
+    do: <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, code>> <> played(code, recs, self, depth) <>
+          record_body(rest, recs, self, depth)
+
+  defp record_body(<<0x1B, 0x2F, 0x7A, 0x1D, code, rest::binary>>, recs, self, depth),
+    do: <<0x1B, 0x2F, 0x7A, 0x1D, code>> <> played(code, recs, self, depth) <>
+          record_body(rest, recs, self, depth)
+
+  defp record_body(<<b, rest::binary>>, recs, self, depth),
+    do: <<b>> <> record_body(rest, recs, self, depth)
+
+  defp played(code, _recs, code, _depth), do: <<>>
+
+  defp played(code, recs, self, depth) when depth < 16 do
+    case Map.fetch(recs, code) do
+      {:ok, recording} -> record_body(recording, recs, self, depth + 1)
+      :error -> <<>>
+    end
+  end
+
+  defp played(_code, _recs, _self, _depth), do: <<>>
+
+  defp recordings(state), do: Map.new(state.macros, fn {_name, m} -> {m.code, m.recorded} end)
 
   defp sum_deltas(origin, deltas),
     do: Enum.reduce(deltas, origin, fn {dx, dy}, {x, y} -> {x + dx, y + dy} end)
@@ -727,11 +818,26 @@ defmodule TelidrawTranspiler.Compiler do
   # saves DEFP/DEFT as a plain 0x80 too. A body that draws nothing makes no object (skip emission),
   # but the macro is still registered so a call resolves its code (invocation is step 4). Params are
   # bound to 0 for the definition's concrete geometry; the code is explicit or auto-assigned from
-  # 0x20 (96 slots, 0x20-0x7F).
+  # 0x20 (96 slots, 0x20-0x7F). Besides the body, the macro keeps GCU's recording of it
+  # (record_body/4: the body + the def_macro framing's A5, with nested calls expanded the way GCU
+  # records them); a later call replays the recording to find where the pen ends. A definition
+  # cannot be nested inside another one: GCU ends the outer definition at the inner one's opcode.
+  defp compile_macro_def(%{name: name} = p, %{defining: true} = state),
+    do: add_diag(state, p, nested_definition_message("'@macro proc #{name}'"))
+
   defp compile_macro_def(%{name: name, params: params, body: body, code: code_e} = p, state) do
     {code, state} = macro_code(code_e, state)
     bindings = Map.new(params, fn pn -> {pn, 0} end)
-    sub = %{state | buffer: <<>>, pen: {0.0, 0.0}, vars: Map.merge(state.vars, bindings), diags: []}
+
+    sub = %{
+      state
+      | buffer: <<>>,
+        pen: {0.0, 0.0},
+        vars: Map.merge(state.vars, bindings),
+        diags: [],
+        defining: true
+    }
+
     sub = Enum.reduce(body, sub, &compile_statement/2)
     state = %{state | diags: sub.diags ++ state.diags}
 
@@ -741,17 +847,26 @@ defmodule TelidrawTranspiler.Compiler do
 
       sub.buffer == <<>> ->
         # GCU: a body that draws nothing makes no DEF MACRO object; still register the name.
-        %{state | macros: Map.put(state.macros, name, code), next_code: code + 1}
+        macro = %{code: code, body: <<>>, recorded: <<>>}
+        %{state | macros: Map.put(state.macros, name, macro), next_code: code + 1}
 
       true ->
+        recorded = record_body(sub.buffer <> <<0xA5>>, recordings(state), code)
+        macro = %{code: code, body: sub.buffer, recorded: recorded}
+
         %{
           state
           | buffer: NaplpsWriter.def_macro(state.buffer, code, sub.buffer),
-            macros: Map.put(state.macros, name, code),
+            macros: Map.put(state.macros, name, macro),
             next_code: code + 1
         }
     end
   end
+
+  defp nested_definition_message(what),
+    do:
+      "#{what} cannot be nested inside a macro or texture definition: GCU ends the outer " <>
+        "definition at the inner one's opcode"
 
   defp macro_code(nil, state), do: {state.next_code, state}
 
@@ -766,21 +881,25 @@ defmodule TelidrawTranspiler.Compiler do
   # byte, framed by the invocation escape + code-set restore (NaplpsWriter.macro_call). Args are
   # parsed but do not change the invocation: GCU plays the recorded body regardless of call args.
   # first_positioned is cleared by move and by a macro call (full tracking across every object
-  # type is a refinement; the common move-then-call and call-first cases are covered).
+  # type is a refinement; the common move-then-call and call-first cases are covered). Playing the
+  # body moves the drawing point (GCU, measured: a LINE REL body moves it by the delta), so the
+  # pen becomes wherever the body leaves it when played from the call position (replay_pen).
   defp compile_macro_call(%{name: name} = c, state) do
     case Map.fetch(state.macros, name) do
       :error ->
         add_diag(state, c, "Unknown macro '#{name}' (define it with @macro proc)")
 
-      {:ok, code} ->
+      {:ok, %{code: code, recorded: recorded}} ->
         {px, py} = state.pen
         # GCU: first positioned object -> A4 absolute (the call position = the pen); later ->
         # A5 pen-relative delta. The call is invoked at the current pen, so the delta is (0,0).
         {pos_op, operand} =
           if state.first_positioned, do: {0xA4, {px, py}}, else: {0xA5, {0.0, 0.0}}
+
         %{
           state
           | buffer: NaplpsWriter.macro_call(state.buffer, code, operand, pos_op: pos_op),
+            pen: replay_pen(recorded, {px, py}, recordings(state)),
             first_positioned: false
         }
     end
@@ -791,10 +910,15 @@ defmodule TelidrawTranspiler.Compiler do
   # `def-texture <mask> { body }`: compile the body block into its own buffer through the
   # normal emitters (so its geometry goes through NaplpsWriter.draw/mb_xy), then frame it as
   # `84 <mask> body 85` + the code-set restore via NaplpsWriter.def_texture. The body is raw
-  # (GCU does not decode it); the drawing pen is left unchanged (a definition draws nothing).
+  # (GCU does not decode it). When the definition ends, GCU's decoder puts the drawing point back
+  # at (0,0) whatever the pen was (measured under emulation; NAP.txt says the same), so the pen
+  # becomes (0,0) here too. Like a macro, it cannot be nested inside another definition.
+  defp compile_def_texture(d, %{defining: true} = state),
+    do: add_diag(state, d, nested_definition_message("'def-texture'"))
+
   defp compile_def_texture(%{mask: mask_e, body: body} = d, state) do
     {mask_v, state} = eval(mask_e, state)
-    sub = %{state | buffer: <<>>, pen: {0.0, 0.0}, diags: []}
+    sub = %{state | buffer: <<>>, pen: {0.0, 0.0}, diags: [], defining: true}
     sub = Enum.reduce(body, sub, &compile_statement/2)
     state = %{state | diags: sub.diags ++ state.diags}
 
@@ -803,7 +927,7 @@ defmodule TelidrawTranspiler.Compiler do
         add_diag(state, d, "def-texture mask must be 1-4 (masks A-D), got #{trunc(mask_v)}")
 
       mb ->
-        %{state | buffer: NaplpsWriter.def_texture(state.buffer, mb, sub.buffer)}
+        %{state | buffer: NaplpsWriter.def_texture(state.buffer, mb, sub.buffer), pen: {0.0, 0.0}}
     end
   end
 

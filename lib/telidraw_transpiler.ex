@@ -41,6 +41,9 @@ defmodule TelidrawTranspiler do
     * `:init` (default `true`) — prepend `NaplpsWriter.gcu_init/0`, which sets up
       the graphics environment (domain, texture, shift-in) so the resulting stream
       is a self-contained, drawable NAPLPS picture.
+    * `:terminate` (default: the value of `:init`) — append `A5`, the byte GCU ends
+      every file with (`NaplpsWriter.gcu_end/1`); without it GCU takes the end of the
+      file as the last command's final operand.
 
   ## Coverage
 

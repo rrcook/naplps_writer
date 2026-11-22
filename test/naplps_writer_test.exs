@@ -86,8 +86,15 @@ defmodule NaplpsWriterTest do
       assert bytes == <<0x99, 0x9A>>
     end
 
-    test "SI only after an ESC" do
+    test "SI only after an ESC (default state: GCU's, esc_seen on at the first text object)" do
+      # GCU's r25c2e starts each save with esc_seen set, so a leading SI is kept.
       {bytes, _} = NaplpsWriter.serialize_text(<<0x0F, "a", 0x1B, 0x0F, 0x0F>>)
+      assert bytes == <<0x0F, "a", 0x1B, 0x0F>>
+    end
+
+    test "SI is dropped when no ESC has been seen" do
+      state = %{reverse_video: false, underline: false, esc_seen: false}
+      {bytes, _} = NaplpsWriter.serialize_text(<<0x0F, "a", 0x1B, 0x0F, 0x0F>>, state)
       assert bytes == <<"a", 0x1B, 0x0F>>
     end
 

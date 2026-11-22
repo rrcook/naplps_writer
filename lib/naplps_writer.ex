@@ -105,6 +105,18 @@ defmodule NaplpsWriter do
     buffer <> init_buffer
   end
 
+  @doc """
+  Append the end-of-file byte GCU writes after every drawing: `A5` (POINT SET REL with no
+  operand). `src/naplps_write.c` `gcu_write` ends with `fputc(0xA5)` and all seven GCU-written
+  samples end in `A5`. It ends the last command, so a reader does not take the end of the file as
+  that command's final operand: without it GCU reads the last vertex of a trailing LINE REL as
+  `ff c0 c0` and a re-save gains a segment.
+
+      iex> NaplpsWriter.gcu_end(<<0xA9, 0xC0, 0xC0, 0xC9>>)
+      <<0xA9, 0xC0, 0xC0, 0xC9, 0xA5>>
+  """
+  def gcu_end(buffer), do: buffer <> <<@cmd_set_point_rel>>
+
   def select_color(buffer, color) do
     buffer <> <<@cmd_select_color, color>>
   end
@@ -194,14 +206,16 @@ defmodule NaplpsWriter do
   (`0x99`/`0x9A`) are emitted only when they change state; everything else is copied. Returns
   `{filtered_bytes, new_state}`; `state` tracks `reverse_video` / `underline` (whether each mode is
   currently on) and `esc_seen` across calls (GCU keeps these writer-global, as `tog88` / `tog99` /
-  `esc_seen`). SELECT COLOR sequences are copied verbatim here (GCU also diffs them against
-  the last graphic colour — a refinement tied to the attribute reference table).
+  `esc_seen`). The default state is GCU's at the first text object of a save (`r25c2e`, I 0x25c2e):
+  both modes off and `esc_seen` **true**, so a leading SI is kept. SELECT COLOR sequences are copied
+  verbatim here (GCU also diffs them against the last graphic colour — a refinement tied to the
+  attribute reference table).
 
       iex> {bytes, _} = NaplpsWriter.serialize_text(<<0x88, 0x88, 0x89, 0x89>>)
       iex> bytes
       <<0x88, 0x89>>
   """
-  def serialize_text(text, state \\ %{reverse_video: false, underline: false, esc_seen: false})
+  def serialize_text(text, state \\ %{reverse_video: false, underline: false, esc_seen: true})
       when is_binary(text) do
     {rev, state} =
       Enum.reduce(:binary.bin_to_list(text), {[], state}, fn c, {acc, st} ->
