@@ -122,6 +122,36 @@ defmodule NaplpsWriter do
   end
 
   @doc """
+  Append a RESET (`A0 <b1> <b2>`) choosing what to reset. `flags` is a keyword list, everything off
+  by default. First byte: `domain: true` (bit 1), `color: 0..3` (bits 3-2), `screen: 0..7`
+  (bits 6-4). Second byte: `text:` (bit 1), `blink:` (bit 2), `fields:` (bit 3), `texture:` (bit 4),
+  `macros:` (bit 5), `drcs:` (bit 6). Bits are numbered from 1, as in NAP.txt's RESET section.
+
+  GCU stores both bytes and writes them back. In its default configuration (DS:8418 = 0) it first
+  clears the colour bits (`src/naplps_read.c` reset_object: `reset_b1 &= 0xF9`). Its decoder acts
+  on `domain`, `color`, `screen`, `text` (the cursor and the drawing point go home) and `macros`
+  (every macro deleted). It keeps the other bits without acting on them.
+
+      iex> NaplpsWriter.reset(<<>>)
+      <<0xA0, 0xC0, 0xC0>>
+      iex> NaplpsWriter.reset(<<>>, screen: 1, text: true, macros: true)
+      <<0xA0, 0xC8, 0xD1>>
+  """
+  def reset(buffer, flags \\ []) do
+    b1 =
+      bit(flags, :domain) ||| (Keyword.get(flags, :color, 0) &&& 0x03) <<< 1 |||
+        (Keyword.get(flags, :screen, 0) &&& 0x07) <<< 3
+
+    b2 =
+      bit(flags, :text) ||| bit(flags, :blink) <<< 1 ||| bit(flags, :fields) <<< 2 |||
+        bit(flags, :texture) <<< 3 ||| bit(flags, :macros) <<< 4 ||| bit(flags, :drcs) <<< 5
+
+    buffer <> <<@cmd_reset, 0xC0 ||| b1, 0xC0 ||| b2>>
+  end
+
+  defp bit(flags, key), do: if(Keyword.get(flags, key, false), do: 1, else: 0)
+
+  @doc """
   Append a DEF TEXTURE mask definition: `84 <mask> <body> 85` followed by GCU's code-set
   restore escape (`ESC ) W ESC ~`). `mask` is the mask byte `0x41..0x44` (A-D); `body` is the
   raw mask-definition bytes, emitted verbatim (GCU does not decode the body). Geometry for the
@@ -192,13 +222,44 @@ defmodule NaplpsWriter do
     |> draw_text_raw(text)
   end
 
-  def text_attributes(buffer, point) do
-    text_size_buffer = mb_xy(<<>>, point)
-    # mvp at the moment - assume default rotation, cursor etc.
-    # Proportional spacing, same as used in Prodigy
-    default_text_buffer = <<@cmd_text_attr, 0xF0, 0xC0>>
-    buffer <> default_text_buffer <> text_size_buffer
+  @doc """
+  Append a TEXT command: `A2 <b1> <b2>` and then the character field size `{w, h}` via `mb_xy/2`.
+  With `point` = `nil` the size is left out, and a decoder keeps the size it has (NAP.txt TEXT).
+  `fields` sets the six 2-bit fields by code (bits numbered from 1, as in NAP.txt). First byte:
+  `spacing` (bits 6-5: 0 = 1, 1 = 5/4, 2 = 3/2, 3 = proportional), `path` (bits 4-3: right, left,
+  up, down), `rotation` (bits 2-1: 0, 90, 180, 270 degrees). Second byte: `cursor` (bits 6-5:
+  underscore, block, cross-hair, custom), `move` (bits 4-3: cursor and drawing point move together,
+  cursor leads, drawing point leads, independent), `interrow` (bits 2-1: 1, 5/4, 3/2, 2). Fields not
+  given are 0, except `spacing`, which defaults to proportional (3), the spacing Prodigy uses. GCU's
+  decoder reads the fields from the same bits (`src/naplps_read.c` h_text) and writes them back
+  from its text record.
+
+      iex> NaplpsWriter.text_attributes(<<>>, {1/40, 5/128})
+      <<0xA2, 0xF0, 0xC0, 0xC0, 0xC1, 0xF2>>
+      iex> NaplpsWriter.text_attributes(<<>>, nil, spacing: 0, path: 3, cursor: 1, interrow: 2)
+      <<0xA2, 0xCC, 0xD2>>
+  """
+  def text_attributes(buffer, point, fields \\ []) do
+    f = fn key, default -> Keyword.get(fields, key, default) &&& 0x03 end
+    b1 = f.(:spacing, 3) <<< 4 ||| f.(:path, 0) <<< 2 ||| f.(:rotation, 0)
+    b2 = f.(:cursor, 0) <<< 4 ||| f.(:move, 0) <<< 2 ||| f.(:interrow, 0)
+    size = if point == nil, do: <<>>, else: mb_xy(<<>>, point)
+    buffer <> <<@cmd_text_attr, 0xC0 ||| b1, 0xC0 ||| b2>> <> size
   end
+
+  @doc """
+  Append the code-set switch GCU writes inside a text object where the character set changes
+  (`src/gcu_text.c`, the text serializer). The text that follows prints from that set:
+  `:primary` SI; `:supplementary` `ESC n` (LS2; G2 holds the supplementary set by default);
+  `:mosaic` `ESC / } ESC o` (G3 := mosaic, LS3); `:drcs` `ESC / { ESC o` (G3 := DRCS, LS3).
+
+      iex> NaplpsWriter.charset_switch(<<>>, :mosaic)
+      <<0x1B, 0x2F, 0x7D, 0x1B, 0x6F>>
+  """
+  def charset_switch(buffer, :primary), do: buffer <> <<@cmd_shift_in>>
+  def charset_switch(buffer, :supplementary), do: buffer <> @esc_ls2_supplementary
+  def charset_switch(buffer, :mosaic), do: buffer <> @esc_mosaic_ls3
+  def charset_switch(buffer, :drcs), do: buffer <> @esc_drcs_ls3
 
   @doc """
   Serialize a text blob the way GCU's writer does (`src/naplps_write.c` `r25c68`, I 0x25c68):

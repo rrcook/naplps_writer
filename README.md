@@ -79,11 +79,13 @@ Without it, GCU reads the end of the file as the last command's final operand
   `arc`/`arc-outline`, `polygon`/`polygon-outline`, the `*-rel` relative
   variants, the `*-set` absolute-origin variants (`line-set`, `rect-set`,
   `arc-set`, `polygon-set`, plus their `-rel`/`-outline`/`abs` forms), and
-  `text`. `line` and `line-rel` accept **multiple x/y pairs** and draw the whole
+  `text` (in the primary, supplementary, mosaic or DRCS set) and `text-raw`.
+  `line` and `line-rel` accept **multiple x/y pairs** and draw the whole
   connected run as a single polyline (e.g. `line 0.2 0.2 0.3 0.3 0.4 0.4`), the
   same as `line-set`/`line-set-rel`.
 * **Attributes** — `color` (palette index, `fg`/`fg bg`), `set-color` (RGB),
-  `texture`, `domain`, `wait`, `blink`, `field`, `reset`, `nsr`.
+  `texture` (with an optional mask size), `domain` (with an optional pel size),
+  `text-style`, `wait`, `blink`, `field`, `reset` (with flags), `nsr`.
 * **Structure** — `with { … }` blocks (compile to explicit set-then-restore),
   `repeat`, `for … in a..b`, `if/else`, `proc` definitions and calls (inlined),
   `let` and `palette` bindings, and compile-time arithmetic

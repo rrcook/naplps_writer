@@ -49,6 +49,7 @@ defmodule TelidrawTranspiler.Lexer do
     "point-rel" => :point_rel,
     "text" => :text,
     "text-raw" => :text_raw,
+    "text-style" => :text_style,
     "color" => :color,
     "set-color" => :set_color,
     "texture" => :texture,

@@ -97,6 +97,13 @@ defmodule NaplpsConstants do
       @esc_macro_invoke <<0x1B, 0x2F, 0x7A, 0x1B, 0x6F>>
       @esc_macro_invoke_ss3 <<0x1B, 0x2F, 0x7A, 0x1D>>
 
+      # GCU's code-set switches inside a text object, written where the character set changes
+      # (src/gcu_text.c, the text serializer): LS2 for the supplementary set (G2 holds it by
+      # default), and G3 := mosaic / G3 := DRCS (GCU's `ESC / {` form) followed by LS3.
+      @esc_ls2_supplementary <<0x1B, 0x6E>>
+      @esc_mosaic_ls3 <<0x1B, 0x2F, 0x7D, 0x1B, 0x6F>>
+      @esc_drcs_ls3 <<0x1B, 0x2F, 0x7B, 0x1B, 0x6F>>
+
       #From the GCU/Prodigy palette
       @color_black           0xC0
       @color_red             0xC4

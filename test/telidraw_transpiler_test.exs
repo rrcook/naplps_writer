@@ -526,4 +526,201 @@ polygon 0.5 0.5|
                NaplpsWriter.draw(<<>>, 0xA4, {0.5, 0.5}) <> <<0xA5>>
     end
   end
+
+  defp diag_messages(src) do
+    assert {:error, diags} = TelidrawTranspiler.transpile(src, init: false)
+    Enum.map(diags, & &1.message)
+  end
+
+  # RESET bits as GCU stores and writes them; the pen and compiler state follow GCU's decoder.
+  describe "reset flags" do
+    test "flags set their bits (first byte: domain, color, screen; second: the rest)" do
+      assert bare("reset text macros screen 1") == <<0xA0, 0xC8, 0xD1>>
+      assert bare("reset domain color 3 screen 7 text blink fields texture macros drcs") ==
+               <<0xA0, 0xFF, 0xFF>>
+      assert bare("reset color 1 blink") == <<0xA0, 0xC2, 0xC2>>
+    end
+
+    test "only the command's own line is read" do
+      assert bare("reset\nmove 0 0") == <<0xA0, 0xC0, 0xC0>> <> bare("move 0 0")
+    end
+
+    test "bad flags and values are errors" do
+      assert ["reset color must be 0-3, got 4"] = diag_messages("reset color 4")
+      assert ["reset screen needs a number"] = diag_messages("reset screen")
+      assert [msg] = diag_messages("reset bogus")
+      assert msg =~ "got 'bogus'"
+    end
+
+    test "reset text sends the pen to the text home (0, 190/256), as GCU does" do
+      src = "move 64/256 64/256\nreset text\npolygon 128/256 128/256"
+      assert ends_with_polygon_delta(bare(src), {128, -62})
+    end
+
+    test "no other bit moves the pen" do
+      src = "move 64/256 64/256\nreset domain color 3 screen 7 blink fields texture drcs\n" <>
+              "polygon 128/256 128/256"
+
+      assert ends_with_polygon_delta(bare(src), {64, 64})
+    end
+
+    test "a RESET text in a macro body moves the pen when the call replays it" do
+      src = "@macro proc m() { reset text }\nmove 64/256 64/256\n@m\npolygon 128/256 128/256"
+      assert ends_with_polygon_delta(bare(src), {128, -62})
+    end
+
+    test "reset macros deletes the macros, so a later call is an error" do
+      src = "@macro proc m() { line-rel 1/256 1/256 }\nreset macros\n@m"
+      assert ["Unknown macro 'm' (define it with @macro proc)"] = diag_messages(src)
+    end
+
+    test "reset macros inside a definition is an error" do
+      assert [msg] = diag_messages("@macro proc m() { reset macros }")
+      assert msg =~ "restarts the definition"
+    end
+
+    test "reset text puts the text style back to the default" do
+      bytes = bare("text-style path down\nreset text\ntext \"a\" 1/40 5/128")
+      assert String.ends_with?(bytes, NaplpsWriter.text_attributes(<<>>, {1 / 40, 5 / 128}) <> "a")
+    end
+
+    test "reset text turns reverse video off, so the next 0x88 is written" do
+      assert bare(~s|text-raw "\\x88a"\nreset text\ntext-raw "\\x88b"|) ==
+               <<0x88, "a", 0xA0, 0xC0, 0xC1, 0x88, "b">>
+    end
+  end
+
+  describe "text-style (TEXT fields)" do
+    test "named fields set their bits; without size there is no size operand" do
+      assert bare("text-style path down cursor block") == <<0xA2, 0xFC, 0xD0>>
+    end
+
+    test "size and every field" do
+      bytes = bare("text-style size 1/40 5/128 spacing 1 rotation 90 move independent interrow 5/4")
+      assert bytes == <<0xA2, 0xC1, 0xCD>> <> NaplpsWriter.mb_xy(<<>>, {1 / 40, 5 / 128})
+    end
+
+    test "fields keep their values, and sized text uses them" do
+      assert bare("text-style path down\ntext-style cursor block") ==
+               <<0xA2, 0xFC, 0xC0, 0xA2, 0xFC, 0xD0>>
+
+      assert bare("text-style spacing 3/2\ntext \"ab\" 1/40 5/128") ==
+               <<0xA2, 0xE0, 0xC0, 0xA2, 0xE0, 0xC0>> <>
+                 NaplpsWriter.mb_xy(<<>>, {1 / 40, 5 / 128}) <> "ab"
+    end
+
+    test "a variable can give a value" do
+      assert bare("let r = 90\ntext-style rotation r") == <<0xA2, 0xF1, 0xC0>>
+    end
+
+    test "unknown fields and values are errors" do
+      assert ["text-style path takes right, left, up, down"] = diag_messages("text-style path up-ish")
+      assert ["text-style spacing takes 1, 1.25, 1.5, proportional"] =
+               diag_messages("text-style spacing 2")
+
+      assert [msg] = diag_messages("text-style colour 1")
+      assert msg =~ "got 'colour'"
+    end
+  end
+
+  describe "texture mask size and domain pel" do
+    test "texture takes an optional mask size" do
+      assert bare("texture 1 0 4 1/20 1/20") == <<0xA3, 0xE1>> <> NaplpsWriter.mb_xy(<<>>, {1 / 20, 1 / 20})
+      assert ["texture takes line highlight fill [maskWidth maskHeight]"] =
+               diag_messages("texture 1 0 4 1/20")
+
+      # GCU writes a negative (mirrored) mask size back positive
+      assert [msg] = diag_messages("texture 1 0 4 -1/20 1/20")
+      assert msg =~ "negative mask size"
+    end
+
+    test "domain takes an optional pel size, at multi-byte 3 and 2-D only" do
+      assert bare("domain 1 3 2 2/256 3/256") == <<0xA1, 0xC8>> <> NaplpsWriter.mb_xy(<<>>, {2 / 256, 3 / 256})
+      assert [msg] = diag_messages("domain 1 4 2 2/256 2/256")
+      assert msg =~ "needs multi-byte 3 and 2-D"
+    end
+
+    test "sizes follow the coordinate mode" do
+      src = "#coord pixels\n#resolution 256 192\ntexture 1 0 4 16 12"
+      assert bare(src) == <<0xA3, 0xE1>> <> NaplpsWriter.mb_xy(<<>>, {16 / 256, 12 / 192})
+    end
+
+    test "with blocks put the previous mask size and pel back" do
+      assert String.ends_with?(bare("with texture 1 0 4 1/20 1/20 { move 0 0 }"),
+               <<0xA3, 0xC0>> <> NaplpsWriter.mb_xy(<<>>, {1 / 16, 1 / 16}))
+
+      assert String.ends_with?(bare("with domain 1 3 2 2/256 2/256 { move 0 0 }"),
+               <<0xA1, 0xC8>> <> NaplpsWriter.mb_xy(<<>>, {1 / 256, 1 / 256}))
+    end
+
+    test "a with block without a size restores only the fixed byte, as before" do
+      assert String.ends_with?(bare("with texture 1 0 4 { move 0 0 }"), <<0xC0, 0xA3, 0xC0>>)
+    end
+  end
+
+  # GCU's in-text set switches (src/gcu_text.c): SI, ESC n, ESC / } ESC o, ESC / { ESC o.
+  describe "text in other character sets" do
+    test "mosaic, drcs and supplementary text start with GCU's switch" do
+      assert bare(~s|text mosaic "!\\x7f"|) == <<0x1B, 0x2F, 0x7D, 0x1B, 0x6F, 0x21, 0x7F>>
+      assert bare(~s|text drcs "AB"|) == <<0x1B, 0x2F, 0x7B, 0x1B, 0x6F, "AB">>
+      assert bare(~s|text supplementary "#$"|) == <<0x1B, 0x6E, "#$">>
+    end
+
+    test "primary text after another set starts with SI; no switch when the set is in GL" do
+      assert bare(~s|text "a"\ntext mosaic "!"\ntext mosaic "?"\ntext "b"|) ==
+               <<"a", 0x1B, 0x2F, 0x7D, 0x1B, 0x6F, "!?", 0x0F, "b">>
+    end
+
+    test "text primary is plain text" do
+      assert bare(~s|text primary "Hi"|) == bare(~s|text "Hi"|)
+    end
+
+    test "codes GCU does not keep are errors" do
+      assert [msg] = diag_messages(~s|text mosaic "@"|)
+      assert msg =~ "0x40-0x5E"
+      assert [msg] = diag_messages(~s|text supplementary "A"|)
+      assert msg =~ "non-spacing accents"
+    end
+
+    test "DEL is a character in the mosaic set only" do
+      assert bare(~s|text "a\\x7f"|) == "a"
+      assert bare(~s|text mosaic "\\x7f"|) == <<0x1B, 0x2F, 0x7D, 0x1B, 0x6F, 0x7F>>
+    end
+
+    test "after text-raw leaves another set in GL, the next text switches back" do
+      assert bare(~s|text-raw "\\x1bn#"\ntext "a"|) == <<0x1B, 0x6E, "#", 0x0F, "a">>
+    end
+  end
+
+  # GCU reads text after an LS3 macro call as macro calls (measured): the call's ESC o leaves the
+  # macro set in GL.
+  describe "GL after a macro call" do
+    @mac "@macro proc m() { line-rel 16/256 16/256 }\nmove 64/256 64/256\n"
+
+    test "text after a call starts with SI" do
+      assert String.ends_with?(bare(@mac <> "@m\ntext \"ab\""), <<0x1B, 0x7E, 0x0F, "ab">>)
+      assert String.ends_with?(bare(@mac <> "@m\ntext-raw \"ab\""), <<0x1B, 0x7E, 0x0F, "ab">>)
+    end
+
+    test "@name ss3 uses the SS3 form, which leaves GL alone" do
+      assert String.ends_with?(
+               bare(@mac <> "@m ss3\ntext \"ab\""),
+               <<0x1B, 0x2F, 0x7A, 0x1D, 0x20, 0x1B, 0x29, 0x57, 0x1B, 0x7E, "ab">>
+             )
+    end
+
+    test "an SS3 call still re-designates G3, so mosaic text switches again" do
+      bytes = bare(@mac <> "text mosaic \"!\"\n@m ss3\ntext mosaic \"?\"")
+      assert String.ends_with?(bytes, <<0x1B, 0x7E, 0x1B, 0x2F, 0x7D, 0x1B, 0x6F, "?">>)
+    end
+
+    test "an SS3 call moves the pen like an LS3 call" do
+      assert ends_with_polygon_delta(bare(@mac <> "@m ss3\npolygon 128/256 128/256"), {48, 48})
+    end
+
+    test "text in a macro body starts with SI (the body may play with the macro set in GL)" do
+      assert bare("@macro proc m() { text \"x\" }\ntext \"y\"") ==
+               <<0x80, 0x20, 0x0F, "x", 0xA5, 0x85, "y">>
+    end
+  end
 end

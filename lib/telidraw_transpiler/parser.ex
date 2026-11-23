@@ -38,6 +38,7 @@ defmodule TelidrawTranspiler.Parser do
                    :point_rel,
                    :text,
                    :text_raw,
+                   :text_style,
                    :color,
                    :set_color,
                    :texture,
@@ -136,8 +137,21 @@ defmodule TelidrawTranspiler.Parser do
   defp parse_macro_call(toks) do
     {at, rest} = expect(toks, :at)
     {name, rest} = expect(rest, :identifier)
+    # `@name ss3` invokes through SS3 instead of LS3. Read it before the args: `ss3` is also the SS3
+    # mnemonic, which would otherwise end the call and start a raw statement.
+    {ss3, rest} =
+      case rest do
+        [%Token{kind: :identifier, lexeme: w, line: l} | rest2] when l == name.line ->
+          if String.downcase(w) == "ss3", do: {true, rest2}, else: {false, rest}
+
+        _ ->
+          {false, rest}
+      end
+
     {args, rest} = parse_command_args(rest, [])
-    {%{type: :macro_call, name: name.lexeme, args: args, line: at.line, col: at.col}, rest}
+
+    {%{type: :macro_call, name: name.lexeme, args: args, ss3: ss3, line: at.line, col: at.col},
+     rest}
   end
 
   defp parse_proc_decl(toks, as_macro) do
@@ -357,11 +371,47 @@ defmodule TelidrawTranspiler.Parser do
 
   defp parse_raw_bytes(toks, acc), do: {Enum.reverse(acc), toks}
 
+  # `reset` and `text-style` take flag and field words (some are keywords, such as `text`, `domain`,
+  # `move`) mixed with numbers. Only the command's own line is read: these commands have no fixed
+  # argument count, and a statement on the next line must not be taken as a flag.
+  defp parse_command_call([%Token{kind: kind} = tok | rest]) when kind in [:reset, :text_style] do
+    {args, rest} = parse_line_words(rest, tok.line, [])
+    {%{type: :command, kind: kind, args: args, line: tok.line, col: tok.col}, rest}
+  end
+
+  # `text drcs "..."`: `drcs` is a keyword, so take it here as the character-set word.
+  defp parse_command_call([%Token{kind: :text} = tok, %Token{kind: :drcs, line: l} = set | rest])
+       when l == tok.line do
+    {args, rest} = parse_command_args(rest, [])
+    word = %{type: :ident, name: "drcs", line: set.line, col: set.col}
+    {%{type: :command, kind: :text, args: [word | args], line: tok.line, col: tok.col}, rest}
+  end
+
   defp parse_command_call(toks) do
     {tok, rest} = advance(toks)
     {args, rest} = parse_command_args(rest, [])
     {%{type: :command, kind: tok.kind, args: args, line: tok.line, col: tok.col}, rest}
   end
+
+  # Words and expressions on `line`: identifiers and numbers parse as expressions (a bare word is an
+  # :ident node, so variables still work as values); a keyword token becomes an :ident word.
+  defp parse_line_words([%Token{line: l, kind: kind} = tok | rest] = toks, line, acc)
+       when l == line do
+    cond do
+      MapSet.member?(@expr_start, kind) ->
+        {expr, rest} = parse_expression(toks)
+        parse_line_words(rest, line, [expr | acc])
+
+      tok.lexeme =~ ~r/^[a-z][a-z0-9-]*$/ ->
+        word = %{type: :ident, name: tok.lexeme, line: tok.line, col: tok.col}
+        parse_line_words(rest, line, [word | acc])
+
+      true ->
+        {Enum.reverse(acc), toks}
+    end
+  end
+
+  defp parse_line_words(toks, _line, acc), do: {Enum.reverse(acc), toks}
 
   defp parse_command_args([%Token{kind: kind} = tok | _] = toks, acc) do
     # Stop at an identifier that resolves to a mnemonic: it starts the NEXT

@@ -52,6 +52,7 @@ let center = (x + 0.1) * 2   // arithmetic
 | `polygon-set sx sy v1x v1y ...` | PolygonSetFilled | absolute start, then absolute verts |
 | `polygon-set abs sx sy dx1 dy1 ...` | PolygonSetFilled | exact form: start abs + relative tail |
 | `text "..."`           | AsciiCharCommand seq   | ASCII string (printable only)     |
+| `text set "..."`       | text in another set    | `supplementary`, `mosaic`, `drcs` (or `primary`); see Character sets |
 | `text-raw "..."`       | text blob with controls | raw bytes incl. C0/C1; see Text controls |
 
 ## Attributes 🎛️
@@ -62,14 +63,47 @@ let center = (x + 0.1) * 2   // arithmetic
 | `color FG BG`                 | SelectColor with bg                                |
 | `set-color G R B`             | Define palette entry RGB (3-bit each, 0-7)         |
 | `texture line highlight fill` | TEXTURE: line pattern (0-3), highlight bool, fill pattern (0-3) |
+| `texture line highlight fill mw mh` | …and the size of the programmable masks A–D (not negative: GCU drops the mirror) |
 | `def-texture mask { … }`      | DEF TEXTURE: define mask A–D (mask 1–4); see Definitions |
 | `domain sv mv [dim]`          | DOMAIN: single-byte/multi-byte/dimensionality      |
+| `domain sv mv dim pw ph`      | …and the logical pel size (multi-byte 3, 2-D only)  |
+| `text-style field value …`    | TEXT: text size and the six text fields; see Text style |
 | `wait n`                      | WAIT: n tenths of a second                         |
 | `blink toIdx onTenths offTenths [delay]` | BLINK process                       |
 | `field`                       | IncrementalField: full screen                      |
 | `field x y w h`               | IncrementalField with bounds                       |
-| `reset`                       | RESET (selective)                                  |
+| `reset [flag …]`              | RESET (selective); bare `reset` resets nothing; see below |
 | `nsr`                         | Non-Selective Reset                                |
+
+Mask and pel sizes are in the current coordinate mode, like `rect` sizes. In a `with texture` or
+`with domain` block that gives one, the size in effect before the block is put back at its end.
+
+### RESET flags
+
+`reset` takes any of these words, on the same line:
+
+| Flag        | Bit                  | What GCU's decoder does                                   |
+|-------------|----------------------|-----------------------------------------------------------|
+| `domain`    | 1st byte, bit 1      | DOMAIN back to its defaults (the pel to 0,0)              |
+| `color N`   | 1st byte, bits 3–2   | N = 1–3: colour mode and palette reset (GCU drops these bits when it re-saves) |
+| `screen N`  | 1st byte, bits 6–4   | N = 1–7: clear screen / border                            |
+| `text`      | 2nd byte, bit 1      | text back to its defaults; cursor and drawing point go home |
+| `blink`     | 2nd byte, bit 2      | stored only                                               |
+| `fields`    | 2nd byte, bit 3      | stored only                                               |
+| `texture`   | 2nd byte, bit 4      | stored only                                               |
+| `macros`    | 2nd byte, bit 5      | every macro deleted                                       |
+| `drcs`      | 2nd byte, bit 6      | stored only                                               |
+
+```td
+reset text macros screen 1     // A0 C8 D1
+```
+
+The compiler follows what GCU's decoder does:
+- After `reset text`, the pen is at the text home, (0, 190/256). Reverse video and underline are off,
+  and the text style is back to its default.
+- After `reset macros`, calling a macro defined before it is a compile error. `reset macros` inside a
+  macro or texture body is also an error, because GCU restarts the definition it is recording.
+- No other flag moves the pen.
 
 ## Block structure
 
@@ -120,6 +154,63 @@ Its bytes pass through GCU's text serializer rules:
 `\xHH` escapes work in any string literal; string literals are byte strings, so a `\x88` is the single
 byte `0x88`.
 
+After a macro call, `text-raw` starts with an SI, because the call leaves the macro set in GL (see
+Macros). Otherwise its bytes are written as given. If they leave another character set in GL, the
+next `text` switches back.
+
+## Text style ✒️
+
+`text-style` writes a TEXT command right away with the fields you name. Fields you don't name keep
+their current values. Later sized text (`text "..." w h`) uses the same fields. Give all the words on
+the `text-style` line.
+
+| Field      | Values                                                  | Default        |
+|------------|---------------------------------------------------------|----------------|
+| `size W H` | character field size                                    | —              |
+| `spacing`  | `1`, `5/4`, `3/2`, `proportional`                       | `proportional` |
+| `path`     | `right`, `left`, `up`, `down`                           | `right`        |
+| `rotation` | `0`, `90`, `180`, `270`                                 | `0`            |
+| `cursor`   | `underscore`, `block`, `crosshair`, `custom`            | `underscore`   |
+| `move`     | `together`, `cursor-leads`, `point-leads`, `independent` | `together`     |
+| `interrow` | `1`, `5/4`, `3/2`, `2`                                  | `1`            |
+
+```td
+text-style size 1/40 5/128 path down cursor block
+move 0.1 0.6
+text "DOWN"
+```
+
+Without `size`, the TEXT command has no size operand, and the text keeps the size it had. `move`
+couples the text cursor to the drawing point. With `cursor-leads` or `independent`, a `move` no longer
+positions text: text starts at the text cursor. GCU drops text whose start is off the field for its
+path. Put the cursor somewhere first with a cursor control in `text-raw`, such as `\x1E` (home).
+
+## Character sets 🔣
+
+`text` takes an optional set word before the string. Each set is written with the switch GCU's own
+text writer uses where the set changes:
+
+| Set             | Switch              | Codes                                                         |
+|-----------------|---------------------|---------------------------------------------------------------|
+| `primary`       | SI                  | printable ASCII (the default; `text "..."` is the same)        |
+| `supplementary` | `ESC n`             | `0x20`–`0x3F`, `0x50`–`0x7E`                                   |
+| `mosaic`        | `ESC / } ESC o`     | `0x20`–`0x3F`, `0x5F`–`0x7F`                                   |
+| `drcs`          | `ESC / { ESC o`     | `0x20`–`0x7F` (the shapes come from the terminal's DRCS set)   |
+
+```td
+move 0.1 0.5
+text "Score "
+text mosaic "\x7f\x7f\x3f"     // switch to mosaics
+text " ok"                     // switch back: SI
+```
+
+The compiler tracks which set is in GL. The switch is written only when the set changes, and primary
+text after another set starts with SI. Two kinds of code are compile errors because GCU does not keep
+them:
+- Mosaic `0x40`–`0x5E`: GCU prints these as spaces.
+- Supplementary `0x40`–`0x4F`: these are non-spacing accents, which GCU writes back as primary-set
+  letters.
+
 ## Definitions: texture masks and macros 🧩
 
 ### Texture masks
@@ -169,6 +260,11 @@ move 0.6 0.2
   pen is wherever playing the body leaves it, so relative drawing continues from the end of the
   macro's drawing. An absolute `move` inside a body makes the macro draw at that fixed position, not at
   the pen.
+- `@name ss3` — the same invocation through SS3 (`ESC / z SS3`, one byte shorter). GCU writes this
+  form for a call it read that way. `ss3` must come right after the name.
+- **Text after a call starts with SI.** The default invocation's `ESC o` leaves the macro set in GL,
+  and GCU reads printable bytes after it as more macro calls, so the compiler puts an SI before the
+  next text. The SS3 form leaves GL alone and needs no SI.
 - **Calling a macro from another macro's body plays the inner macro twice in GCU.** GCU runs a
   definition while it records it, and it records the bytes the inner call plays as well as the call
   itself, so replaying the outer macro draws the inner one via the call and again from the copy.
