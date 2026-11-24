@@ -206,6 +206,15 @@ mix run decode_naplps.exs <file>       # within the project
 elixir decode_naplps.exs <file>        # standalone
 ```
 
+It lists everything the writer and the Telidraw compiler emit: PDI commands with
+their operands (coordinates, RESET flags, TEXT and TEXTURE fields, SELECT COLOR
+modes, SET COLOR, WAIT and BLINK intervals), DEF MACRO / DEF TEXTURE definitions
+with their bodies indented up to END, REPEAT counts, the C1 text controls
+(reverse video, underline, …), C0 cursor controls and NSR, and the escape
+sequences that designate and invoke character sets. It tracks which set is in GL,
+so printable bytes are listed as TEXT, MOSAIC, SUPPLEMENTARY, DRCS or MACRO CALL
+(`ESC / z ESC o <code>` or `ESC / z SS3 <code>`).
+
 `test/xy_utilities_test.exs` covers every public function plus a round-trip
 property that uses `NaplpsWriter.mb_xy/2` as the oracle:
 
