@@ -67,12 +67,20 @@ defmodule TelidrawTranspiler.Compiler do
   # Elixir's TEXT fields: proportional spacing (as Prodigy uses), NAPLPS defaults otherwise.
   @default_text_style [spacing: 3, path: 0, rotation: 0, cursor: 0, move: 0, interrow: 0]
 
+  # The decoder's TEXT state (fields as codes, the character field in 1/256 units): GCU's after
+  # start-up (its template TEXT `A2 C0 C0` + 6 x 10), and after RESET text (src/naplps_read.c
+  # text_reset: 0x199 x 0x280 in GCU's 1/64 units).
+  @gcu_start_text %{fields: [spacing: 0, path: 0, rotation: 0], size: {6, 10}}
+  @gcu_reset_text %{fields: [spacing: 0, path: 0, rotation: 0], size: {0x199 / 64, 0x280 / 64}}
+
   @doc """
   Compile `program` (from `TelidrawTranspiler.Parser`) into `{bytes, diagnostics}`.
 
   Options: `:init` (default `true`) prepends `NaplpsWriter.gcu_init/0`; `:terminate` (default: the
   value of `:init`) appends GCU's end-of-file `A5` (`NaplpsWriter.gcu_end/1`), so a complete file ends
   the way every GCU-written file does and fragments compiled with `init: false` stay bare.
+  `:gcu_form` (default `false`) writes the file in GCU's normalized form, the bytes GCU writes when
+  it loads and saves it (`NaplpsGcuForm.normalize/2`; needs `init`); `:palette` is passed on to it.
   """
   @spec compile(map(), keyword()) :: {binary(), [map()]}
   def compile(program, opts \\ []) do
@@ -99,10 +107,25 @@ defmodule TelidrawTranspiler.Compiler do
       gl: :primary,
       # The TEXT fields Elixir writes in every TEXT command (codes, NaplpsWriter.text_attributes/3).
       text_style: @default_text_style,
+      # The decoder's TEXT state, which sets how far text moves the pen: GCU's start-up state
+      # (spacing 1, character field 6 x 10) until a TEXT command is written.
+      dec_text: @gcu_start_text,
+      # The exact text cursor while text continues (GCU's cursor moves in 1/64 steps; the pen is
+      # its whole-unit part). nil once anything else moves the pen.
+      text_cursor: nil,
       # DOMAIN logical pel and TEXTURE mask size in effect (the values gcu_init writes), so a `with`
       # block that changes them can put them back.
       pel: {1 / 256, 1 / 256},
       mask_size: {1 / 16, 1 / 16},
+      # GCU's reader model (gcu_reader_before/after): see "GCU's reader" below. After gcu_init
+      # GCU's line pen is at the screen centre; a fragment (init: false) assumes the caller's
+      # context has it at the drawing point, as it assumes GL holds the primary set.
+      line_pen_synced: not init,
+      line_run_open: false,
+      text_open: false,
+      text_origin: nil,
+      custom_field: false,
+      def_sync_needed: false,
       color: 7,
       coord_mode: :fractions,
       dw: 256,
@@ -121,9 +144,29 @@ defmodule TelidrawTranspiler.Compiler do
 
     state = Enum.reduce(program.statements, state, &compile_statement/2)
     buffer = if terminate, do: NaplpsWriter.gcu_end(state.buffer), else: state.buffer
-
-    {buffer, Enum.reverse(state.diags)}
+    {buffer, diags} = gcu_form(buffer, Enum.reverse(state.diags), init, opts)
+    {buffer, diags}
   end
+
+  # The file in GCU's normalized form (`gcu_form: true`); a construct the normalizer does not model
+  # is a diagnostic rather than a guess.
+  defp gcu_form(buffer, diags, init, opts) do
+    cond do
+      not Keyword.get(opts, :gcu_form, false) or diags != [] ->
+        {buffer, diags}
+
+      not init ->
+        {buffer, diags ++ [gcu_form_diag("gcu_form needs a complete file (init: true)")]}
+
+      true ->
+        case NaplpsGcuForm.normalize(buffer, palette: Keyword.get(opts, :palette, false)) do
+          {:ok, bytes} -> {bytes, diags}
+          {:error, why} -> {buffer, diags ++ [gcu_form_diag("gcu_form: " <> why)]}
+        end
+    end
+  end
+
+  defp gcu_form_diag(msg), do: %{severity: :error, line: 0, column: 0, message: msg}
 
   # ---- directives ----------------------------------------------------------
 
@@ -183,7 +226,111 @@ defmodule TelidrawTranspiler.Compiler do
 
   # ---- command dispatch ----------------------------------------------------
 
-  defp compile_command(%{kind: kind, args: args} = c, state) do
+  defp compile_command(%{kind: kind} = c, state) do
+    {state, new_text} = gcu_reader_before(kind, c, state)
+    state = compile_command_kind(c, state)
+    gcu_reader_after(kind, c, state, new_text)
+  end
+
+  # ---- GCU's reader --------------------------------------------------------
+  #
+  # GCU's reader turns a stream into objects with two pens (src/naplps_read.c): the decoder's
+  # drawing point, which resolves relative coordinates and is the pen this compiler tracks, and
+  # its line pen (DS:1D60, env pen_x/pen_y), where a LINE REL object starts (b_line_seg). Moves,
+  # points, LINE ABS, the SET& forms, arcs, rectangles and FIELD set the line pen to the drawing
+  # point; it starts at the screen centre (128,100)/256, stays at a polygon's last vertex (the
+  # drawing point goes back to the first) and at the start of text (the cursor moves on), and a
+  # DEF TEXTURE moves only the drawing point. GCU then reads a LINE REL as a line from the line pen
+  # to the right end point: a different line (measured). A POINT SET REL (0,0) (`A5 C0 C0 C0`,
+  # b_move_pen) puts the line pen at the drawing point and stays relative inside a macro body, so
+  # it goes before a LINE REL whenever the two may differ.
+  #
+  # Two text cases are misread too (measured): text right after a LINE REL run makes GCU drop the
+  # run's deltas (it writes the line with zero bytes), so the same `A5 C0 C0 C0` closes the run
+  # first; and a new text object on the row of the previous text object's start, to its right, is
+  # padded with spaces up to the cursor (GCU's text document lives on until a FIELD), which GCU's
+  # own save then writes after the cursor, moving the text. A full-screen FIELD + A4 (GCU's own
+  # `B8 A4` text framing) starts a new document there; inside a custom field GCU pads from the
+  # field's origin by design, so text there is left as it is.
+
+  @sync_line_pen <<0xA5, 0xC0, 0xC0, 0xC0>>
+
+  # Before a command: the bytes that make GCU read it as written. Returns {state, new_text}, where
+  # new_text is the start of the text object a text command opens (nil otherwise).
+  defp gcu_reader_before(:line_rel, _c, %{line_pen_synced: false} = state),
+    do: {sync_line_pen(state), nil}
+
+  # A macro body's first LINE REL, before anything else positions: the sync goes before the
+  # definition instead (compile_macro_def), where it keeps the body as written.
+  defp gcu_reader_before(:line_rel, _c, %{line_pen_synced: :def_start} = state),
+    do: {%{state | def_sync_needed: true}, nil}
+
+  defp gcu_reader_before(kind, c, state) when kind in [:text, :text_raw] do
+    state = if state.line_run_open, do: sync_line_pen(state), else: state
+    sized = kind == :text and length(c.args) >= 3
+
+    if state.text_open and not sized do
+      {state, nil}
+    else
+      start = trunc_cells(state.text_cursor || round_cells(state.pen))
+
+      if text_padded?(state, start),
+        do: {state |> emit_bytes(<<@op_field>>) |> draw(@op_point_set_abs, start) |> set_pen(start), start},
+        else: {state, start}
+    end
+  end
+
+  defp gcu_reader_before(_kind, _c, state), do: {state, nil}
+
+  defp sync_line_pen(state),
+    do: %{emit_bytes(state, @sync_line_pen) | line_pen_synced: true, line_run_open: false}
+
+  defp text_padded?(%{defining: true}, _start), do: false
+  defp text_padded?(%{custom_field: true}, _start), do: false
+  defp text_padded?(%{text_origin: nil}, _start), do: false
+
+  defp text_padded?(%{text_origin: {ox, oy}}, {x, y}),
+    do: units(y) == units(oy) and units(x) > units(ox)
+
+  defp units(v), do: round(v * 256)
+
+  @positioning [:move, :goto, :move_rel, :point, :point_rel, :line, :line_set, :arc, :arc_outline] ++
+                 [:arc_set, :arc_set_outline, :rect, :rect_outline, :rect_set, :rect_set_outline]
+  @polygons [:polygon, :poly_outline, :poly_set, :poly_set_outline]
+  # Commands that end GCU's text object (SELECT COLOR does not: its colour goes into the text).
+  @attributes [:set_color, :texture, :domain, :text_style, :nsr, :wait, :blink, :reset]
+
+  defp gcu_reader_after(kind, _c, state, _new) when kind in @positioning,
+    do: %{state | line_pen_synced: true, line_run_open: false, text_open: false}
+
+  defp gcu_reader_after(kind, _c, state, _new) when kind in [:line_rel, :line_set_rel],
+    do: %{state | line_pen_synced: true, line_run_open: true, text_open: false}
+
+  defp gcu_reader_after(kind, _c, state, _new) when kind in @polygons,
+    do: %{state | line_pen_synced: false, line_run_open: false, text_open: false}
+
+  defp gcu_reader_after(:field, c, state, _new) do
+    %{
+      state
+      | line_pen_synced: true,
+        line_run_open: false,
+        text_open: false,
+        text_origin: nil,
+        custom_field: c.args != []
+    }
+  end
+
+  defp gcu_reader_after(kind, _c, state, new) when kind in [:text, :text_raw] do
+    origin = new || state.text_origin
+    %{state | line_pen_synced: false, line_run_open: false, text_open: true, text_origin: origin}
+  end
+
+  defp gcu_reader_after(kind, _c, state, _new) when kind in @attributes,
+    do: %{state | text_open: false}
+
+  defp gcu_reader_after(_kind, _c, state, _new), do: state
+
+  defp compile_command_kind(%{kind: kind, args: args} = c, state) do
     case kind do
       k when k in [:move, :goto] ->
         with_xy(c, state, fn x, y, st -> emit_move(st, x, y) end)
@@ -199,17 +346,22 @@ defmodule TelidrawTranspiler.Compiler do
 
       :rect_outline ->
         with_xy(c, state, fn w, h, st ->
-          draw(st, @op_rect_outlined, {nx(st, w), ny(st, h)})
+          {nwv, nhv} = {nx(st, w), ny(st, h)}
+          {px, py} = st.pen
+          st |> draw(@op_rect_outlined, {nwv, nhv}) |> set_pen({px + nwv, py})
         end)
 
+      # Relative positioning and points move the pen by the delta (GCU, measured).
       :move_rel ->
         with_xy(c, state, fn dx, dy, st ->
-          draw(st, @op_point_set_rel, {nx(st, dx), ny(st, dy)})
+          d = {nx(st, dx), ny(st, dy)}
+          st |> draw(@op_point_set_rel, d) |> set_pen(sum_deltas(st.pen, [d]))
         end)
 
       :point_rel ->
         with_xy(c, state, fn dx, dy, st ->
-          draw(st, @op_point_rel, {nx(st, dx), ny(st, dy)})
+          d = {nx(st, dx), ny(st, dy)}
+          st |> draw(@op_point_rel, d) |> set_pen(sum_deltas(st.pen, [d]))
         end)
 
       :line_rel ->
@@ -344,8 +496,9 @@ defmodule TelidrawTranspiler.Compiler do
     if valid_pairs?(args) do
       {nums, state} = eval_all(args, state)
       verts = norm_points(state, nums)
-      {rel, last} = abs_to_rel(verts, state.pen)
-      state |> draw(op, rel) |> set_pen(last)
+      {rel, _last} = abs_to_rel(verts, state.pen)
+      # GCU's drawing point goes back to the polygon's start (the pen) afterwards (measured).
+      draw(state, op, rel)
     else
       add_diag(state, c, "#{c.kind} needs pairs of x,y coords (got #{length(args)})")
     end
@@ -357,27 +510,44 @@ defmodule TelidrawTranspiler.Compiler do
   #
   #   * absolute forms encode each vertex absolutely and advance the pen to the
   #     last vertex;
-  #   * relative forms encode each pair as a delta and leave the pen unchanged
-  #     (deltas are emitted verbatim — the pen tracker is only used as the anchor
-  #     for absolute-relative conversions elsewhere).
+  #   * relative forms encode each pair as a delta; the pen ends at the end of the run, as GCU's
+  #     does (`line-rel`: pen + all deltas; `line-set-rel`: its absolute start + the deltas).
   defp emit_polyline(%{args: args} = c, state, opcode, relative, verb) do
     if valid_pairs?(args) do
       {nums, state} = eval_all(args, state)
       pts = norm_points(state, nums)
 
-      if relative do
-        draw(state, opcode, pts)
-      else
-        state |> draw(opcode, pts) |> set_pen(List.last(pts))
+      cond do
+        not relative and opcode == @op_set_line_abs and length(pts) > 2 ->
+          # GCU reads further SET&LINE operands as new (set, line) pairs, not as more vertices, so
+          # a longer run is SET&LINE to the first vertex, then LINE ABS for the rest (same picture
+          # under the spec; GCU, measured).
+          [start, first | more] = pts
+          state |> draw(opcode, [start, first]) |> draw(@op_line_abs, more) |> set_pen(List.last(pts))
+
+        not relative ->
+          state |> draw(opcode, pts) |> set_pen(List.last(pts))
+
+        opcode == @op_set_line_rel and length(pts) > 2 ->
+          [start, first | more] = pts
+          state |> draw(opcode, [start, first]) |> draw(@op_line_rel, more) |> set_pen(sum_deltas(start, tl(pts)))
+
+        opcode == @op_set_line_rel ->
+          state |> draw(opcode, pts) |> set_pen(sum_deltas(hd(pts), tl(pts)))
+
+        true ->
+          state |> draw(opcode, pts) |> set_pen(sum_deltas(state.pen, pts))
       end
     else
       add_diag(state, c, "#{verb} needs pairs of x,y coords (got #{length(args)})")
     end
   end
 
+  # rect-set x y w h: the pen ends at the start advanced by the width, as after `rect` (GCU).
   defp emit_rect_set(c, state, op) do
     with_n(c, 4, state, fn [x, y, w, h], st ->
-      draw(st, op, [{nx(st, x), ny(st, y)}, {nx(st, w), ny(st, h)}])
+      {xn, yn, wn} = {nx(st, x), ny(st, y), nx(st, w)}
+      st |> draw(op, [{xn, yn}, {wn, ny(st, h)}]) |> set_pen({xn + wn, yn})
     end)
   end
 
@@ -412,6 +582,7 @@ defmodule TelidrawTranspiler.Compiler do
 
   # polygon-set sx sy v1x v1y ...        (all absolute) or
   # polygon-set abs sx sy dx1 dy1 ...    (start absolute + relative tail)
+  # Either way the pen ends at the start: GCU's drawing point goes back there after a polygon.
   defp emit_poly_set(%{args: [%{type: :ident, name: "abs"} | rest]} = c, state, op) do
     cond do
       length(rest) < 4 or rem(length(rest), 2) != 0 ->
@@ -422,8 +593,7 @@ defmodule TelidrawTranspiler.Compiler do
         [sx, sy | tail] = nums
         start = {nx(state, sx), ny(state, sy)}
         rels = norm_points(state, tail)
-        last = Enum.reduce(rels, start, fn {dx, dy}, {px, py} -> {px + dx, py + dy} end)
-        state |> draw(op, [start | rels]) |> set_pen(last)
+        state |> draw(op, [start | rels]) |> set_pen(start)
     end
   end
 
@@ -440,8 +610,7 @@ defmodule TelidrawTranspiler.Compiler do
         {nums, state} = eval_all(args, state)
         [start | tail_verts] = norm_points(state, nums)
         {rel_tail, _} = abs_to_rel(tail_verts, start)
-        last = List.last(tail_verts)
-        state |> draw(op, [start | rel_tail]) |> set_pen(last)
+        state |> draw(op, [start | rel_tail]) |> set_pen(start)
     end
   end
 
@@ -460,7 +629,11 @@ defmodule TelidrawTranspiler.Compiler do
         {[fg, bg], state} = eval_all(args, state)
         fg = trunc(fg)
         bg = trunc(bg)
-        bytes = <<@op_select_color, select_color_byte(fg), select_color_byte(bg)>>
+        # GCU's reader takes the foreground from a two-operand SELECT COLOR only when it differs
+        # from the background (src/naplps_read.c h_select_color: `if (bg != first) fg = first`), so
+        # equal colours are preceded by a one-operand SELECT COLOR that sets the foreground.
+        lead = if fg == bg, do: <<@op_select_color, select_color_byte(fg)>>, else: <<>>
+        bytes = lead <> <<@op_select_color, select_color_byte(fg), select_color_byte(bg)>>
         emit_bytes(state, bytes) |> Map.put(:color, fg)
 
       _ ->
@@ -594,7 +767,15 @@ defmodule TelidrawTranspiler.Compiler do
 
       if flags[:text] do
         ts = %{state.text_state | reverse_video: false, underline: false}
-        %{state | pen: @text_home, text_state: ts, text_style: @default_text_style}
+
+        %{
+          state
+          | pen: @text_home,
+            text_cursor: nil,
+            text_state: ts,
+            text_style: @default_text_style,
+            dec_text: @gcu_reset_text
+        }
       else
         state
       end
@@ -619,7 +800,8 @@ defmodule TelidrawTranspiler.Compiler do
     case text_style_args(args, state, state.text_style, nil) do
       {:ok, style, size, state} ->
         buffer = NaplpsWriter.text_attributes(state.buffer, size, style)
-        %{state | buffer: buffer, text_style: style}
+        dec_size = if size, do: decoded_cells(size), else: state.dec_text.size
+        %{state | buffer: buffer, text_style: style, dec_text: %{fields: style, size: dec_size}}
 
       {:error, msg, state} ->
         add_diag(state, c, msg)
@@ -684,16 +866,18 @@ defmodule TelidrawTranspiler.Compiler do
     end
   end
 
-  defp emit_field(%{args: []}, state), do: emit_bytes(state, <<@op_field>>)
+  # A FIELD puts the drawing point at its origin; a full-screen FIELD (no operands) at (0,0) (GCU).
+  defp emit_field(%{args: []}, state), do: state |> emit_bytes(<<@op_field>>) |> set_pen({0.0, 0.0})
 
   defp emit_field(%{args: args}, state) when length(args) == 4 do
     {[ox, oy, dx, dy], state} = eval_all(args, state)
+    origin = {nx(state, ox), ny(state, oy)}
 
     operands =
-      NaplpsWriter.mb_xy(<<>>, {nx(state, ox), ny(state, oy)}) <>
+      NaplpsWriter.mb_xy(<<>>, origin) <>
         NaplpsWriter.mb_xy(<<>>, {nx(state, dx), ny(state, dy)})
 
-    emit_bytes(state, <<@op_field>> <> operands)
+    state |> emit_bytes(<<@op_field>> <> operands) |> set_pen(origin)
   end
 
   defp emit_field(c, state),
@@ -731,11 +915,39 @@ defmodule TelidrawTranspiler.Compiler do
 
       nil ->
         state = switch_gl(state, set)
-        %{state | buffer: NaplpsWriter.draw_text_raw(state.buffer, chars)}
+        %{state | buffer: NaplpsWriter.draw_text_raw(state.buffer, chars)} |> advance_text([{set, chars}])
 
       msg ->
         add_diag(state, c, msg)
     end
+  end
+
+  # Move the pen the way GCU's cursor moves for these characters (NaplpsText.gcu_text_advance,
+  # with the decoder's TEXT state); a list of {set, characters} runs. Text starts at the decoder's
+  # pen: the rounded encoded position, or, when text continues, the cursor where the last text
+  # ended (kept exact, since GCU's cursor has 1/64 steps). Afterwards the pen is GCU's object pen,
+  # the cursor truncated to whole 1/256 units, so later geometry lands exactly.
+  defp advance_text(state, runs) do
+    %{fields: fields, size: size} = state.dec_text
+    start = state.text_cursor || round_cells(state.pen)
+
+    deltas =
+      for {set, chars} <- runs do
+        {dx, dy} = NaplpsText.gcu_text_advance(chars, set, fields, size)
+        {dx / 256, dy / 256}
+      end
+
+    cursor = sum_deltas(start, deltas)
+    %{state | pen: trunc_cells(cursor), text_cursor: cursor}
+  end
+
+  defp round_cells({x, y}), do: {round(x * 256) / 256, round(y * 256) / 256}
+  defp trunc_cells({x, y}), do: {trunc(x * 256) / 256, trunc(y * 256) / 256}
+
+  # The character field as the decoder reads it back from mb_xy (its rounding), in 1/256 units.
+  defp decoded_cells(size) do
+    {w, h} = hd(decode_vertices(:binary.bin_to_list(NaplpsWriter.mb_xy(<<>>, size))))
+    {w * 256, h * 256}
   end
 
   # Highest printable code per set: DEL (0x7F) is a character in the mosaic and DRCS sets (GCU keeps
@@ -764,7 +976,12 @@ defmodule TelidrawTranspiler.Compiler do
   # current text-style fields.
   defp text_size(rest, state) when length(rest) >= 2 do
     {[w, h], state} = eval_all(Enum.take(rest, 2), state)
-    %{state | buffer: NaplpsWriter.text_attributes(state.buffer, {w, h}, state.text_style)}
+
+    %{
+      state
+      | buffer: NaplpsWriter.text_attributes(state.buffer, {w, h}, state.text_style),
+        dec_text: %{fields: state.text_style, size: decoded_cells({w, h})}
+    }
   end
 
   defp text_size(_rest, state), do: state
@@ -788,39 +1005,77 @@ defmodule TelidrawTranspiler.Compiler do
   # toggle state persists across text commands (GCU keeps it writer-global). No pen move. The bytes
   # are written as given, except that an SI goes first when GL holds the macro set (after a macro
   # call, or at the start of a definition body), where printable bytes would play macros.
-  defp emit_text_raw(%{args: [%{type: :str, value: s} | rest]}, state) do
+  defp emit_text_raw(%{args: [%{type: :str, value: s} | rest]} = c, state) do
     state = text_size(rest, state)
     state = if state.gl in [:macro, :body_start], do: switch_gl(state, :primary), else: state
     {filtered, tstate} = NaplpsWriter.serialize_text(s, state.text_state)
+    {gl, runs} = text_walk(filtered, state.gl, [])
 
-    %{
-      state
-      | buffer: NaplpsWriter.draw_text_raw(state.buffer, filtered),
-        text_state: tstate,
-        gl: gl_after(filtered, state.gl)
-    }
+    # the bytes print from whatever set GL holds, so the codes GCU does not keep are checked per run
+    case Enum.find_value(runs, fn {set, chars} -> bad_text_code(set, chars) end) do
+      nil ->
+        %{
+          state
+          | buffer: NaplpsWriter.draw_text_raw(state.buffer, filtered),
+            text_state: tstate,
+            gl: gl
+        }
+        |> advance_text(runs)
+
+      msg ->
+        add_diag(state, c, msg)
+    end
   end
 
   defp emit_text_raw(c, state),
     do: add_diag(state, c, "text-raw expects a string literal as first arg")
 
-  # The set in GL after `bytes`: SI -> primary, ESC n (LS2) -> supplementary, ESC o (LS3) after
-  # GCU's mosaic / DRCS / macro designation -> that set; any other LS3 or SO, or a G3 designation
-  # while a G3 set is in GL, -> unknown. SS2/SS3 shift one character only and leave GL alone.
-  defp gl_after(<<>>, gl), do: gl
-  defp gl_after(<<0x0F, rest::binary>>, _gl), do: gl_after(rest, :primary)
-  defp gl_after(<<0x0E, rest::binary>>, _gl), do: gl_after(rest, :other)
-  defp gl_after(<<0x1B, 0x6E, rest::binary>>, _gl), do: gl_after(rest, :supplementary)
-  defp gl_after(<<0x1B, 0x2F, 0x7D, 0x1B, 0x6F, rest::binary>>, _gl), do: gl_after(rest, :mosaic)
-  defp gl_after(<<0x1B, 0x2F, 0x7B, 0x1B, 0x6F, rest::binary>>, _gl), do: gl_after(rest, :drcs)
-  defp gl_after(<<0x1B, 0x2F, 0x20, 0x7B, 0x1B, 0x6F, rest::binary>>, _gl), do: gl_after(rest, :drcs)
-  defp gl_after(<<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, rest::binary>>, _gl), do: gl_after(rest, :macro)
-  defp gl_after(<<0x1B, 0x6F, rest::binary>>, _gl), do: gl_after(rest, :other)
+  # Walk text bytes as GCU's decoder reads them: which set is in GL afterwards, and the printing
+  # characters with the set each prints in. SI -> primary, ESC n (LS2) -> supplementary, ESC o (LS3)
+  # after GCU's mosaic / DRCS / macro designation -> that set; any other LS3 or SO, or a G3
+  # designation while a G3 set is in GL, -> unknown (printed as primary for the pen). SS2 prints one
+  # supplementary character; other escape sequences and controls print nothing (cursor controls such
+  # as CR, LF and BS are not modelled). Printable bytes while GL holds the macro set are calls.
+  defp text_walk(<<>>, gl, acc), do: {gl, Enum.reverse(acc)}
+  defp text_walk(<<0x0F, rest::binary>>, _gl, acc), do: text_walk(rest, :primary, acc)
+  defp text_walk(<<0x0E, rest::binary>>, _gl, acc), do: text_walk(rest, :other, acc)
+  defp text_walk(<<0x1B, 0x6E, rest::binary>>, _gl, acc), do: text_walk(rest, :supplementary, acc)
 
-  defp gl_after(<<0x1B, 0x2F, rest::binary>>, gl) when gl in [:mosaic, :drcs, :macro],
-    do: gl_after(rest, :other)
+  defp text_walk(<<0x1B, 0x2F, 0x7D, 0x1B, 0x6F, rest::binary>>, _gl, acc),
+    do: text_walk(rest, :mosaic, acc)
 
-  defp gl_after(<<_, rest::binary>>, gl), do: gl_after(rest, gl)
+  defp text_walk(<<0x1B, 0x2F, 0x7B, 0x1B, 0x6F, rest::binary>>, _gl, acc),
+    do: text_walk(rest, :drcs, acc)
+
+  defp text_walk(<<0x1B, 0x2F, 0x20, 0x7B, 0x1B, 0x6F, rest::binary>>, _gl, acc),
+    do: text_walk(rest, :drcs, acc)
+
+  defp text_walk(<<0x1B, 0x2F, 0x7A, 0x1B, 0x6F, rest::binary>>, _gl, acc),
+    do: text_walk(rest, :macro, acc)
+
+  defp text_walk(<<0x1B, 0x6F, rest::binary>>, _gl, acc), do: text_walk(rest, :other, acc)
+
+  defp text_walk(<<0x1B, 0x2F, rest::binary>>, gl, acc) when gl in [:mosaic, :drcs, :macro],
+    do: text_walk(skip_escape(rest), :other, acc)
+
+  defp text_walk(<<0x1B, rest::binary>>, gl, acc), do: text_walk(skip_escape(rest), gl, acc)
+
+  defp text_walk(<<0x19, c, rest::binary>>, gl, acc) when c in 0x20..0x7E,
+    do: text_walk(rest, gl, [{:supplementary, <<c>>} | acc])
+
+  defp text_walk(<<c, rest::binary>>, gl, acc) when c in 0x20..0x7F and gl != :macro do
+    set = if gl in [:primary, :supplementary, :mosaic, :drcs], do: gl, else: :primary
+    # DEL prints only in the mosaic and DRCS sets (GCU's decoder skips it in the others)
+    acc = if c == 0x7F and set not in [:mosaic, :drcs], do: acc, else: [{set, <<c>>} | acc]
+    text_walk(rest, gl, acc)
+  end
+
+  defp text_walk(<<_, rest::binary>>, gl, acc), do: text_walk(rest, gl, acc)
+
+  # The rest of an escape sequence after its ESC: intermediates 0x20-0x2F, then one final byte.
+  defp skip_escape(<<i, rest::binary>>) when i in 0x20..0x2F, do: skip_escape(rest)
+  defp skip_escape(<<_final, rest::binary>>), do: rest
+  defp skip_escape(<<>>), do: <<>>
 
   # ---- with / repeat / for / if / proc -------------------------------------
 
@@ -848,12 +1103,12 @@ defmodule TelidrawTranspiler.Compiler do
     case texture_cmd(nums, state) do
       {:ok, bytes, mask} ->
         prev = state.mask_size
-        state = state |> emit_bytes(bytes) |> put_if(:mask_size, mask)
+        state = %{(state |> emit_bytes(bytes) |> put_if(:mask_size, mask)) | text_open: false}
         state = Enum.reduce(body, state, &compile_statement/2)
         # Restore the default texture (solid line, no highlight, solid fill) and, when the block
         # set a mask size, the one in effect before it.
         restore = if mask, do: NaplpsWriter.mb_xy(<<>>, prev), else: <<>>
-        %{emit_bytes(state, texture_bytes(0, false, 0) <> restore) | mask_size: prev}
+        %{emit_bytes(state, texture_bytes(0, false, 0) <> restore) | mask_size: prev, text_open: false}
 
       {:error, msg} ->
         add_diag(state, w, "with " <> msg)
@@ -866,12 +1121,12 @@ defmodule TelidrawTranspiler.Compiler do
     case domain_cmd(nums, state) do
       {:ok, bytes, pel} ->
         prev = state.pel
-        state = state |> emit_bytes(bytes) |> put_if(:pel, pel)
+        state = %{(state |> emit_bytes(bytes) |> put_if(:pel, pel)) | text_open: false}
         state = Enum.reduce(body, state, &compile_statement/2)
         # Restore defaults (single-byte 1, multi-byte 3, 2D) and, when the block set a pel, the
         # pel in effect before it.
         restore = if pel, do: NaplpsWriter.mb_xy(<<>>, prev), else: <<>>
-        %{emit_bytes(state, domain_bytes(1, 3, 2) <> restore) | pel: prev}
+        %{emit_bytes(state, domain_bytes(1, 3, 2) <> restore) | pel: prev, text_open: false}
 
       {:error, msg} ->
         add_diag(state, w, "with " <> msg)
@@ -967,6 +1222,8 @@ defmodule TelidrawTranspiler.Compiler do
     state
     |> emit_bytes(:binary.list_to_bin([opcode | operands]))
     |> update_pen_from_raw(opcode, operands)
+    # GCU's reader state after raw bytes is not modelled: assume the worst (gcu_reader_before).
+    |> Map.merge(%{line_pen_synced: false, line_run_open: true, text_open: false})
   end
 
   # Mirror the pen-end side effect of a raw-emitted PDI command (mv = 3, matching
@@ -998,9 +1255,17 @@ defmodule TelidrawTranspiler.Compiler do
       0x2A when verts != [] ->
         List.last(verts)
 
+      # SetLineRelative — an absolute start, then deltas: pen ends at start + the deltas.
+      0x2B when verts != [] ->
+        sum_deltas(hd(verts), tl(verts))
+
       # Relative pen offsets / cumulative-relative walks — pen advances by the sum.
-      op when op in [0x25, 0x27, 0x29, 0x2B, 0x34, 0x35, 0x3A, 0x3B] ->
+      op when op in [0x25, 0x27, 0x29, 0x3A, 0x3B] ->
         sum_deltas(pen, verts)
+
+      # Polygon — GCU's drawing point goes back to the polygon's start, which is the pen.
+      op when op in [0x34, 0x35] ->
+        pen
 
       # Arc (mid then end, both relative to pen) — pen ends at the end vertex.
       op when op in [0x2C, 0x2D] and length(verts) >= 2 ->
@@ -1022,10 +1287,14 @@ defmodule TelidrawTranspiler.Compiler do
         [start | sizes] = verts
         Enum.reduce(sizes, start, fn {w, _h}, {x, y} -> {x + w, y} end)
 
-      # PolygonSet (first vertex absolute, rest relative) — pen ends at the sum.
-      op when op in [0x36, 0x37] and length(verts) >= 2 ->
-        [start | rels] = verts
-        sum_deltas(start, rels)
+      # PolygonSet (first vertex absolute, rest relative) — the pen goes back to the start (GCU).
+      op when op in [0x36, 0x37] and verts != [] ->
+        hd(verts)
+
+      # FIELD — the drawing point goes to the field's origin; a full-screen FIELD (no operands)
+      # to (0,0) (GCU, measured).
+      0x38 ->
+        if verts == [], do: {0.0, 0.0}, else: hd(verts)
 
       _ ->
         pen
@@ -1126,10 +1395,18 @@ defmodule TelidrawTranspiler.Compiler do
       state
       | buffer: <<>>,
         pen: {0.0, 0.0},
+        text_cursor: nil,
         vars: Map.merge(state.vars, bindings),
         diags: [],
         defining: true,
-        gl: :body_start
+        gl: :body_start,
+        # GCU records the body from the drawing point; its line pen is synced before the
+        # definition when the body needs it (below) and at every call (the call's A4/A5).
+        line_pen_synced: :def_start,
+        def_sync_needed: false,
+        line_run_open: false,
+        text_open: false,
+        text_origin: nil
     }
 
     sub = Enum.reduce(body, sub, &compile_statement/2)
@@ -1148,12 +1425,18 @@ defmodule TelidrawTranspiler.Compiler do
       true ->
         recorded = record_body(sub.buffer <> <<0xA5>>, recordings(state), code)
         macro = %{code: code, body: sub.buffer, recorded: recorded}
+        # GCU records a body's first LINE REL from its line pen, so that pen must be the drawing
+        # point when the definition starts (else GCU re-encodes the body as a different line).
+        state = if sub.def_sync_needed and state.line_pen_synced != true, do: sync_line_pen(state), else: state
 
         %{
           state
           | buffer: NaplpsWriter.def_macro(state.buffer, code, sub.buffer),
             macros: Map.put(state.macros, name, macro),
-            next_code: code + 1
+            next_code: code + 1,
+            line_pen_synced: false,
+            line_run_open: false,
+            text_open: false
         }
     end
   end
@@ -1203,9 +1486,14 @@ defmodule TelidrawTranspiler.Compiler do
           state
           | buffer: NaplpsWriter.macro_call(state.buffer, code, operand, pos_op: pos_op, ss3: ss3),
             pen: replay_pen(recorded, {px, py}, recordings(state)),
+            text_cursor: nil,
             first_positioned: false,
             gl: call_gl(ss3, state.gl),
-            text_state: %{state.text_state | esc_seen: true}
+            text_state: %{state.text_state | esc_seen: true},
+            # after a call GCU's line pen is the drawing point (measured)
+            line_pen_synced: true,
+            line_run_open: false,
+            text_open: false
         }
     end
   end
@@ -1229,7 +1517,21 @@ defmodule TelidrawTranspiler.Compiler do
 
   defp compile_def_texture(%{mask: mask_e, body: body} = d, state) do
     {mask_v, state} = eval(mask_e, state)
-    sub = %{state | buffer: <<>>, pen: {0.0, 0.0}, diags: [], defining: true, gl: :body_start}
+    # GCU keeps a mask body as bytes (it does not decode it), so its reader model does not apply.
+    sub = %{
+      state
+      | buffer: <<>>,
+        pen: {0.0, 0.0},
+        text_cursor: nil,
+        diags: [],
+        defining: true,
+        gl: :body_start,
+        line_pen_synced: true,
+        line_run_open: false,
+        text_open: false,
+        text_origin: nil
+    }
+
     sub = Enum.reduce(body, sub, &compile_statement/2)
     # Whether GCU decodes text in a mask body is not known, so text there makes GL unknown.
     gl = if sub.gl == :body_start, do: state.gl, else: :other
@@ -1240,7 +1542,15 @@ defmodule TelidrawTranspiler.Compiler do
         add_diag(state, d, "def-texture mask must be 1-4 (masks A-D), got #{trunc(mask_v)}")
 
       mb ->
-        %{state | buffer: NaplpsWriter.def_texture(state.buffer, mb, sub.buffer), pen: {0.0, 0.0}}
+        # the drawing point goes to (0,0) and GCU's line pen stays where it was (measured)
+        %{
+          state
+          | buffer: NaplpsWriter.def_texture(state.buffer, mb, sub.buffer),
+            pen: {0.0, 0.0},
+            text_cursor: nil,
+            line_pen_synced: false,
+            text_open: false
+        }
     end
   end
 
@@ -1383,7 +1693,7 @@ defmodule TelidrawTranspiler.Compiler do
   defp emit_bytes(state, bytes),
     do: %{state | buffer: NaplpsWriter.append_bytes(state.buffer, bytes)}
 
-  defp set_pen(state, {_x, _y} = pen), do: %{state | pen: pen}
+  defp set_pen(state, {_x, _y} = pen), do: %{state | pen: pen, text_cursor: nil}
 
   defp nx(%{coord_mode: :fractions}, v), do: v
   defp nx(%{coord_mode: :pixels, dw: dw}, v), do: v / dw

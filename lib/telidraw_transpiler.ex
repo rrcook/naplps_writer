@@ -44,6 +44,13 @@ defmodule TelidrawTranspiler do
     * `:terminate` (default: the value of `:init`) — append `A5`, the byte GCU ends
       every file with (`NaplpsWriter.gcu_end/1`); without it GCU takes the end of the
       file as the last command's final operand.
+    * `:gcu_form` (default `false`) — write the file in GCU's normalized form, the
+      bytes GCU writes when it loads the file and saves it (`NaplpsGcuForm.normalize/2`):
+      attributes only where they change, SET& forms, shared starts left out, text
+      runs compressed. Needs `init: true`. A construct GCU would change rather than
+      keep is a diagnostic. `:palette` (default `false`) adds GCU's palette
+      definition table (its DS:8418 option); without it palette changes are dropped,
+      as GCU does by default.
 
   ## Coverage
 

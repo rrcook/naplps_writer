@@ -146,4 +146,42 @@ defmodule NaplpsTextTest do
       assert NaplpsText.wrap("a  \n  b", 6, 1000) == ["a b"]
     end
   end
+
+  # GCU's cursor advance, measured under emulation (the pen after the text, in 1/256 units).
+  describe "gcu_text_advance/4" do
+    @prop [spacing: 3, path: 0, rotation: 0]
+
+    test "proportional 'Hello world' at every cell-width rule GCU has" do
+      for {w, gcu} <- [{5, 40}, {6, 48}, {7, 59}, {10, 80}, {12, 90}, {16, 116}] do
+        assert NaplpsText.gcu_text_advance("Hello world", :primary, @prop, {w, 10}) == {gcu * 1.0, 0.0}
+      end
+    end
+
+    test "agrees with char_advance/2 inside 6..11" do
+      for w <- 6..11, c <- 0x20..0x7E do
+        assert NaplpsText.gcu_char_advance(w, c) == NaplpsText.char_advance(w, c)
+      end
+    end
+
+    test "fixed spacing steps 1, 5/4, 3/2 of the width, truncated only by the caller" do
+      assert NaplpsText.gcu_text_advance("Hi", :primary, [spacing: 0], {8, 12}) == {16.0, 0.0}
+      assert NaplpsText.gcu_text_advance("Hi", :primary, [spacing: 1], {8, 12}) == {20.0, 0.0}
+      assert NaplpsText.gcu_text_advance("Hii", :primary, [spacing: 1], {6, 10}) == {22.5, 0.0}
+    end
+
+    test "the path sets the direction; rotation 90 / 270 steps along the height" do
+      f = &NaplpsText.gcu_text_advance("Hi", :primary, &1, {8, 12})
+      assert f.(spacing: 0, path: 1) == {-16.0, 0.0}
+      assert f.(spacing: 0, path: 2) == {0.0, 24.0}
+      assert f.(spacing: 3, path: 3) == {0.0, -24.0}
+      assert f.(spacing: 0, path: 0, rotation: 1) == {24.0, 0.0}
+      assert f.(spacing: 3, path: 2, rotation: 1) == {0.0, 8.0}
+    end
+
+    test "mosaic and DRCS step by the full width; supplementary has its own classes" do
+      assert NaplpsText.gcu_text_advance("!!", :mosaic, @prop, {8, 12}) == {16.0, 0.0}
+      assert NaplpsText.gcu_text_advance("AB", :drcs, @prop, {8, 12}) == {16.0, 0.0}
+      assert NaplpsText.gcu_text_advance("#$", :supplementary, @prop, {8, 12}) == {14.0, 0.0}
+    end
+  end
 end

@@ -68,6 +68,8 @@ defmodule NaplpsText do
       still fits.
   """
 
+  import Bitwise
+
   # Width class per ASCII character, 0x20..0x7E: one entry per character, in
   # code order, 0 = narrowest ("i", "l", "!") through 9 = widest ("W", "M").
   # The class is not a width by itself; @displacement turns it into one for a
@@ -235,6 +237,120 @@ defmodule NaplpsText do
     do: elem(@ascii_width_class, char - 0x20)
 
   def width_class(_char), do: @fallback_class
+
+  # --- GCU's cursor advance ----------------------------------------------------
+  #
+  # What GCU's decoder does (src/naplps_read.c width_table I 0x29466, prop_width I 0x295b8,
+  # text_metrics I 0x2bc32), measured under emulation. GCU works in units of 1/64 of a cell unit
+  # (its TEXT size words); results are returned in cell units like everything else here.
+
+  # Width class per supplementary-set character 0x20..0x7F in proportional spacing (GCU.IMG
+  # DS:B3F4; the ASCII classes above equal GCU's DS:B394).
+  @supplementary_width_class {9, 0, 9, 5, 9, 9, 9, 6, 9, 1, 6, 8, 9, 7, 9, 7, 4, 9, 4, 4, 7, 6, 9,
+                              0, 9, 1, 6, 8, 9, 9, 9, 8, 9, 2, 2, 2, 9, 5, 5, 0, 4, 9, 1, 7, 9, 4,
+                              8, 2, 5, 1, 9, 9, 9, 6, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 6, 9, 6, 5, 9,
+                              9, 9, 5, 9, 9, 9, 5, 5, 9, 6, 9, 9, 9, 6, 5, 6, 0, 4, 4, 7, 9, 9, 6,
+                              4, 2, 5, 0}
+
+  # For cells 12 units wide or more GCU narrows each class by a share of the cell (DS:B4CC)
+  # instead of reading @displacement.
+  @wide_narrowing {6, 5, 4, 4, 3, 2, 1, 2, 1, 0}
+
+  # Fixed-spacing step per TEXT spacing code, in quarters of the cell (DS:B7C2): 1, 5/4, 3/2, and 1
+  # for proportional (whose characters use the width table instead).
+  @spacing_quarters {4, 5, 6, 4}
+
+  # Whether the cursor steps along the cell's width (1) or its height (0), by rotation * 4 + path
+  # (DS:B7CA). The direction is the path's: right +x, left -x, up +y, down -y.
+  @steps_along_width {1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1}
+
+  @doc """
+  Advance of one character in GCU's proportional spacing, as GCU computes it. Equals
+  `char_advance/2` for cell widths 6..11; below and above that GCU has its own rules, which this
+  follows. `set` is `:primary` (ASCII) or `:supplementary`.
+
+      iex> NaplpsText.gcu_char_advance(8, ?i)
+      2.0
+      iex> NaplpsText.gcu_char_advance(12, ?W)
+      12.0
+  """
+  @spec gcu_char_advance(number(), char(), :primary | :supplementary) :: float()
+  def gcu_char_advance(char_width, char, set \\ :primary) do
+    w = round(char_width * 64)
+    elem(gcu_width_table(w), gcu_class(set, char)) / 64
+  end
+
+  @doc """
+  How far GCU's cursor moves for `text` printed in `set`, as `{dx, dy}` in cell units.
+
+  `fields` are the TEXT command's codes (`spacing` 0-3, `path` 0-3, `rotation` 0-3, as in
+  `NaplpsWriter.text_attributes/3`), `size` the character field `{width, height}`. Proportional
+  spacing uses `gcu_char_advance/3` for primary and supplementary characters when the cursor steps
+  along the width; mosaic and DRCS characters, and every step along the height, use the fixed step.
+  Every byte of `text` is taken as a printing character: controls (CR, LF, BS) and wrapping at the
+  field's edge are not modelled.
+
+      iex> NaplpsText.gcu_text_advance("Hi", :primary, [spacing: 0, path: 0, rotation: 0], {8, 12})
+      {16.0, 0.0}
+      iex> NaplpsText.gcu_text_advance("Hi", :primary, [spacing: 3, path: 3, rotation: 0], {8, 12})
+      {0.0, -24.0}
+  """
+  @spec gcu_text_advance(binary(), atom(), keyword(), {number(), number()}) :: {float(), float()}
+  def gcu_text_advance(text, set, fields, {w, h}) do
+    spacing = Keyword.get(fields, :spacing, 0) &&& 3
+    path = Keyword.get(fields, :path, 0) &&& 3
+    rotation = Keyword.get(fields, :rotation, 0) &&& 3
+    along_width = elem(@steps_along_width, rotation * 4 + path) == 1
+    {wf, hf} = {round(w * 64), round(h * 64)}
+    fixed = div(elem(@spacing_quarters, spacing) * if(along_width, do: wf, else: hf), 4)
+    proportional = spacing == 3 and along_width and set in [:primary, :supplementary]
+    table = if proportional, do: gcu_width_table(wf)
+
+    total =
+      Enum.reduce(:binary.bin_to_list(text), 0, fn c, acc ->
+        acc + if(proportional, do: elem(table, gcu_class(set, c)), else: fixed)
+      end) / 64
+
+    case path do
+      0 -> {total, 0.0}
+      1 -> {-total, 0.0}
+      2 -> {0.0, total}
+      3 -> {0.0, -total}
+    end
+  end
+
+  defp gcu_class(:supplementary, c) when c in 0x20..0x7F,
+    do: elem(@supplementary_width_class, c - 0x20)
+
+  defp gcu_class(_set, c), do: width_class(c)
+
+  # GCU's ten proportional advances for a cell `w` text units wide (1/64 of a cell unit).
+  defp gcu_width_table(w) do
+    s = if w < 0, do: -div(-w, 4), else: div(w, 4)
+
+    Enum.map(0..9, fn k ->
+      cond do
+        s < 0x10 ->
+          p = w * k
+          if(p < 0, do: -div(-p, 8), else: div(p, 8)) + 2
+
+        s < 0xC0 ->
+          {si, di} = halve_to_row(s, 1, s)
+          elem(elem(@displacement, di - 6), k) * si * 4
+
+        true ->
+          hi = s &&& 0xFFF0
+          si = (((div(hi * 11, 13) - 0x10) ||| 0x10) - 0x10) &&& 0xFFF0
+          narrowing = (div(elem(@wide_narrowing, k) * si, 6) + 8) &&& 0xFFF0
+          (hi - narrowing) * 4
+      end
+    end)
+    |> List.to_tuple()
+  end
+
+  # Halve the cell width until it indexes a @displacement row (6..11), counting the scale.
+  defp halve_to_row(s, si, di) when di >= 12, do: halve_to_row(s, si * 2, div(s, si * 2))
+  defp halve_to_row(_s, si, di), do: {si, di}
 
   # --- Hyphenation ----------------------------------------------------------
 

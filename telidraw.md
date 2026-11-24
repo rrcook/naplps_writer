@@ -300,6 +300,91 @@ with color 1 {
 reset
 ```
 
+## GCU's reader 🔍
+
+GCU reads a few byte sequences differently from the NAPLPS spec. Each case below was measured by
+running GCU's own code under emulation and comparing what it read with what the spec says. For each
+one the compiler adds bytes that the spec treats as no-ops, so that GCU and a decoder that follows
+the spec both read the picture you wrote.
+
+### Two pens
+
+A decoder that follows the spec has one pen, the *drawing point*. Every relative coordinate is
+added to it, and every command that draws or moves updates it. It is the pen this document means
+everywhere else.
+
+GCU's reader also keeps a second pen, the *line pen*, and uses it for one thing: a `line-rel` (LINE
+REL) line starts at the line pen. Its end point is still the drawing point plus the delta. When the
+two pens are in the same place, this is the line the spec draws.
+
+Most commands put the line pen at the drawing point: `move`, `move-rel`, `point`, `point-rel`,
+`line`, `line-set`, the arcs, the rectangles, `field` and `reset text`. Four things leave the two
+pens apart:
+
+| Where | Line pen | Drawing point |
+|-------|----------|---------------|
+| start of a file | the screen centre, (128/256, 100/256) | (0, 0) |
+| after a polygon | the polygon's last vertex | back at the first vertex |
+| after `text` | the start of the text | moved on with the text cursor |
+| after `def-texture` | where it was before the definition | (0, 0) |
+
+So `polygon …` followed by `line-rel 10/256 0` is read by GCU as a line from the polygon's last
+vertex to the end point, not a 10-unit line from the first vertex.
+
+`A5 C0 C0 C0` is POINT SET REL (0, 0). By the spec it moves the drawing point by nothing. GCU's
+reader also puts the line pen at the drawing point when it reads it. The compiler writes it before a
+`line-rel` whenever the two pens may differ. Because it is relative, it also works inside a macro
+body, wherever the macro is played. After `raw` bytes the compiler does not know where GCU's pens
+are, so it assumes they differ.
+
+### The cases
+
+| Case | What GCU would do | What the compiler adds |
+|------|-------------------|------------------------|
+| `line-rel` first in a file, or after a polygon, text, `def-texture` or raw bytes | starts the line at its *line pen*: the screen centre at start-up, a polygon's last vertex, the start of the text, the point before the texture definition | `A5 C0 C0 C0` (POINT SET REL 0,0) first |
+| a macro body that starts with `line-rel`, defined at such a point | records the body's line from that pen, and re-saves it as a different line | the same `A5 C0 C0 C0` before the definition |
+| `text` right after a `line-rel` run (a `color` between counts as "right after") | loses the run's deltas | `A5 C0 C0 C0` first |
+| `text` that starts a new text object on the row of the previous one, to its right (after a `move`, `wait`, `texture`, …) | pads it with spaces up to the cursor, and its save then moves the text right | a full-screen `field` + `A4 <cursor>` first |
+| `color a a` (equal foreground and background) | keeps the old foreground | `color a` first |
+
+Why each case happens:
+
+- **`line-rel` where the pens differ.** This is the two-pen rule above. The line would start at the
+  line pen instead of the drawing point.
+- **A macro body that starts with `line-rel`.** GCU reads a definition's body while it records it
+  (see Macros), so the body's first line also starts at the line pen. GCU then saves the body from
+  the objects it read, which gives a different line. A sync at the start of the body would be
+  recorded as part of the body, so the compiler puts it before the definition, and the body's bytes
+  stay as you wrote them.
+- **`text` right after a `line-rel` run.** GCU collects consecutive `line-rel` deltas into one line
+  object, which stays open until something ends it. A `color` does not end it. If text comes while
+  the line is still open, GCU loses the run's deltas and saves the line with zero bytes. The
+  `A5 C0 C0 C0` before the text ends the run first.
+- **`text` to the right of the previous text, on the same row.** GCU keeps the text it reads in one
+  text document until a `field` ends it. A new text object that starts on the same row as the
+  previous one's start, further right, is joined to that document with spaces up to the cursor. When
+  GCU saves, it writes `A4 <cursor>` and then those spaces, so the text moves right: a text moved
+  42/256 to the right came back with 7 spaces in front of it. A full-screen `field` (`B8`) ends the
+  document, and `A4 <cursor>` puts the text back where it belongs. This is the `B8 A4` framing GCU
+  writes in front of its own text. An `A4` or `A5` alone does not end the document.
+- **`color a a`.** GCU's SELECT COLOR takes the first operand as the foreground only when the
+  background is different. With equal colours the foreground stays as it was. The one-operand
+  `color a` first sets the foreground, and the two-operand form then sets the background.
+
+Some things the compiler cannot fix:
+- **Text in a custom `field`.** GCU pads text that starts a whole number of character cells from the
+  field's left edge, as in the same-row case above. Inside a custom field GCU does this on purpose, so
+  the compiler leaves the text as written. GCU's save also drops the field's operands.
+- **Text that does not fit.** GCU drops a text line that does not fit on the screen (y below 0, or y
+  plus the line height above 200/256). It wraps text that runs past the right edge of the screen or
+  field, and saves the wrap as a CR and a `field` with operands.
+- **Codes in `text-raw`.** `text-raw` prints from whatever set GL holds, so codes GCU does not keep
+  (mosaic 0x40–0x5E, supplementary accents 0x40–0x4F) are errors there too.
+
+`gcu_form: true` is the transpiler option that writes the bytes GCU itself writes when it loads the
+file and saves it again (see `README.md`). With it, the first two are diagnostics as well: GCU would
+change the picture, and the option reports that rather than guess.
+
 ## Byte-fidelity guarantee ✅
 
 For any `.nap` file F:

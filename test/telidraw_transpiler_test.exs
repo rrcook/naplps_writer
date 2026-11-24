@@ -140,13 +140,14 @@ text-raw "\x88b\x89"|
       assert bare(src) == <<0x88, "a", "b", 0x89>>
     end
 
-    test "does not move the pen" do
+    test "moves the pen by GCU's text advance (6/256 per character at GCU's start-up size)" do
+      # GCU, measured: text moves the drawing point; 'hi' at the default 6 x 10 field = 12/256.
       src = ~S|move 0.5 0.5
 text-raw "\x88hi\x89"
 polygon 0.5 0.5|
-      zero = NaplpsWriter.mb_xy(<<>>, {0.0, 0.0})
+      back = NaplpsWriter.mb_xy(<<>>, {-12 / 256, 0.0})
       assert <<0xA4, _::binary-size(3), 0x88, "hi", 0x89, 0xB5, rest::binary>> = bare(src)
-      assert rest == zero
+      assert rest == back
     end
 
     test "plain text still filters non-printable" do
@@ -721,6 +722,206 @@ polygon 0.5 0.5|
     test "text in a macro body starts with SI (the body may play with the macro set in GL)" do
       assert bare("@macro proc m() { text \"x\" }\ntext \"y\"") ==
                <<0x80, 0x20, 0x0F, "x", 0xA5, 0x85, "y">>
+    end
+  end
+
+  # Where GCU's drawing point is after each command (measured under emulation: a polygon with a
+  # zero first delta starts at the pen). Each test ends with `polygon 128/256 128/256`, whose delta
+  # is (128,128) minus the compiler's pen, in 1/256 units.
+  describe "pen after each command (GCU)" do
+    @p "\npolygon 128/256 128/256"
+
+    test "move-rel and point-rel move the pen by the delta" do
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\nmove-rel 16/256 8/256" <> @p), {48, 56})
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\npoint-rel 16/256 8/256" <> @p), {48, 56})
+    end
+
+    test "line-rel moves the pen by all its deltas" do
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\nline-rel 16/256 8/256 8/256 0" <> @p), {40, 56})
+    end
+
+    test "rect-outline and rect-set advance by the width" do
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\nrect-outline 16/256 8/256" <> @p), {48, 64})
+      assert ends_with_polygon_delta(bare("rect-set 32/256 32/256 16/256 8/256" <> @p), {80, 96})
+    end
+
+    test "after a polygon the pen is back at its start" do
+      src = "move 64/256 64/256\npolygon 96/256 64/256 80/256 96/256" <> @p
+      assert ends_with_polygon_delta(bare(src), {64, 64})
+      assert ends_with_polygon_delta(bare("polygon-set 32/256 32/256 64/256 32/256 48/256 64/256" <> @p), {96, 96})
+    end
+
+    test "a FIELD puts the pen at its origin; a full-screen FIELD at (0,0)" do
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\nfield 32/256 40/256 128/256 64/256" <> @p), {96, 88})
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\nfield" <> @p), {128, 128})
+    end
+
+    test "text moves the pen: 6/256 per character at GCU's start-up size" do
+      assert ends_with_polygon_delta(bare("move 64/256 64/256\ntext \"Hello\"" <> @p), {34, 64})
+    end
+
+    test "proportional text uses GCU's widths" do
+      # GCU, measured: 'Hello world' is 90/256 at a 12-wide field (char_advance/2 gives 86.2 there)
+      src = "move 20/256 64/256\ntext \"Hello world\" 12/256 16/256" <> @p
+      assert ends_with_polygon_delta(bare(src), {18, 64})
+    end
+
+    test "text that continues keeps GCU's fine cursor; the pen is its whole part" do
+      # 5/4 spacing at a 6-wide field: 7.5/256 per character; 64 + 3 * 7.5 = 86.5 -> pen 86
+      src = "text-style spacing 5/4\nmove 64/256 64/256\ntext \"Hi\" 6/256 10/256\ntext \"i\"" <> @p
+      assert ends_with_polygon_delta(bare(src), {42, 64})
+    end
+
+    test "text starts where the decoder's pen is, the rounded encoded position" do
+      # move 0.3 is encoded as 77/256; 'Hello' -> 107/256
+      assert ends_with_polygon_delta(bare("move 0.3 0.3\ntext \"Hello\"" <> @p), {21, 51})
+    end
+  end
+
+  # GCU reads further SET&LINE operands as new (set, line) pairs, so a longer run is split.
+  describe "multi-segment line-set" do
+    test "line-set is SET&LINE to the first vertex, then LINE ABS for the rest" do
+      bytes = bare("line-set 32/256 32/256 48/256 40/256 56/256 48/256")
+      v = fn x, y -> NaplpsWriter.mb_xy(<<>>, {x / 256, y / 256}) end
+      assert bytes == <<0xAA>> <> v.(32, 32) <> v.(48, 40) <> <<0xA8>> <> v.(56, 48)
+    end
+
+    test "line-set-rel is SET&LINE REL with the first delta, then LINE REL for the rest" do
+      bytes = bare("line-set-rel 32/256 32/256 16/256 8/256 8/256 8/256\npolygon 128/256 128/256")
+      v = fn x, y -> NaplpsWriter.mb_xy(<<>>, {x / 256, y / 256}) end
+      assert String.starts_with?(bytes, <<0xAB>> <> v.(32, 32) <> v.(16, 8) <> <<0xA9>> <> v.(8, 8))
+      # the pen ends at the start plus every delta: (56, 48)
+      assert ends_with_polygon_delta(bytes, {72, 80})
+    end
+  end
+
+  # GCU's reader (src/naplps_read.c): a LINE REL object starts at its line pen, which can differ
+  # from the drawing point; text after a LINE REL run loses the run; text resumed on the row of the
+  # previous text object is padded; SELECT COLOR with equal colours keeps the old foreground. The
+  # compiler adds the bytes that make GCU read each case as written (measured under emulation).
+  describe "GCU's reader" do
+    @sync <<0xA5, 0xC0, 0xC0, 0xC0>>
+    @line_rel <<0xA9, 0xC0, 0xC8, 0xD0>>
+
+    test "a LINE REL first in a complete file is preceded by POINT SET REL (0,0)" do
+      # after gcu_init GCU's line pen is the screen centre (128,100)/256
+      assert TelidrawTranspiler.transpile!("line-rel 10/256 0") ==
+               NaplpsWriter.gcu_init() <> @sync <> @line_rel <> <<0xA5>>
+
+      # a fragment assumes the caller's context has it at the drawing point
+      assert bare("line-rel 10/256 0") == @line_rel
+    end
+
+    test "a LINE REL after a polygon, text or DEF TEXTURE is synced" do
+      for pre <- [
+            "polygon 100/256 100/256 140/256 100/256 140/256 140/256",
+            "move 60/256 60/256\ntext \"abc\"",
+            "def-texture 1 {\n  rect 2/256 2/256\n}"
+          ] do
+        assert String.ends_with?(bare(pre <> "\nline-rel 10/256 0"), @sync <> @line_rel), pre
+      end
+    end
+
+    test "a LINE REL after moves, lines, arcs, rectangles and calls needs no sync" do
+      for pre <- [
+            "move 60/256 60/256",
+            "line 40/256 40/256",
+            "arc 100/256 100/256 140/256 100/256",
+            "rect 8/256 8/256",
+            "@macro proc m() { polygon 0 0 16/256 0 16/256 16/256 }\nmove 64/256 64/256\n@m"
+          ] do
+        bytes = bare(pre <> "\nline-rel 10/256 0")
+        assert String.ends_with?(bytes, @line_rel), pre
+        refute String.ends_with?(bytes, @sync <> @line_rel), pre
+      end
+    end
+
+    test "a macro body's first LINE REL is synced before the definition, later ones in the body" do
+      bytes = bare("polygon 100/256 100/256 140/256 100/256\n@macro proc m() { line-rel 4/256 4/256 }")
+      assert String.ends_with?(bytes, @sync <> <<0x80, 0x20, 0xA9>> <> NaplpsWriter.mb_xy(<<>>, {4 / 256, 4 / 256}) <> <<0xA5, 0x85>>)
+
+      # a body that does not start with a LINE REL needs nothing before the definition
+      assert bare("polygon 100/256 100/256 140/256 100/256\n@macro proc m() { move 0 0 }") ==
+               bare("polygon 100/256 100/256 140/256 100/256") <> bare("@macro proc m() { move 0 0 }")
+
+      body = bare("@macro proc m() {\n  polygon 0 0 16/256 0 16/256 16/256\n  line-rel 4/256 4/256\n}")
+      assert :binary.match(body, @sync <> <<0xA9>>) != :nomatch
+    end
+
+    test "text right after a LINE REL run closes the run first" do
+      bytes = bare("move 108/256 88/256\nline-rel 0 20/256\ntext \"cw\"")
+      assert String.ends_with?(bytes, @sync <> "cw")
+
+      # a colour between does not close it either
+      assert String.ends_with?(bare("move 108/256 88/256\nline-rel 0 20/256\ncolor 4\ntext \"cw\""), @sync <> "cw")
+    end
+
+    test "text resumed on the row of the previous text object starts a new field" do
+      at = fn x, y -> <<0xB8, 0xA4>> <> NaplpsWriter.mb_xy(<<>>, {x / 256, y / 256}) end
+      text = "move 108/256 88/256\ntext \"abc\"\n"
+
+      # after TEXTURE (the cursor is at 108 + 3 * 6) and after a move to the right
+      assert String.ends_with?(bare(text <> "texture 3 0 7\ntext \"cw\""), at.(126, 88) <> "cw")
+      assert String.ends_with?(bare(text <> "move 150/256 88/256\ntext \"cw\""), at.(150, 88) <> "cw")
+
+      # not to the left, not on another row, not when the text continues (a colour keeps it open)
+      for rest <- ["move 60/256 88/256\ntext \"cw\"", "move 108/256 100/256\ntext \"cw\"", "color 3\ntext \"cw\""] do
+        assert :binary.match(bare(text <> rest), <<0xB8>>) == :nomatch, rest
+      end
+
+      # nor inside a custom field (GCU pads there from the field's edge by design)
+      src = "field 20/256 20/256 100/256 60/256\ntext \"ab\"\nmove 60/256 20/256\ntext \"cd\""
+      assert String.ends_with?(bare(src), <<0xA4>> <> NaplpsWriter.mb_xy(<<>>, {60 / 256, 20 / 256}) <> "cd")
+    end
+
+    test "equal foreground and background colours are preceded by the foreground alone" do
+      assert bare("color 9 9") == <<0xBE, 0xE4, 0xBE, 0xE4, 0xE4>>
+      assert bare("color 9 3") == <<0xBE, 0xE4, 0xCC>>
+    end
+
+    test "text-raw checks the codes GCU does not keep in the set GL holds" do
+      assert diag_messages("text mosaic \"\\x21\"\ntext-raw \"N\"") |> Enum.any?(&(&1 =~ "mosaic codes"))
+      assert diag_messages("text supplementary \"\\x21\"\ntext-raw \"E\"") |> Enum.any?(&(&1 =~ "accents"))
+      assert TelidrawTranspiler.transpile("text-raw \"NE\"", init: false) == {:ok, "NE"}
+    end
+  end
+
+  # gcu_form: true writes GCU's normalized form (NaplpsGcuForm); the expected bytes are GCU's own
+  # re-save of the plain output under emulation (scratch p_palette_probe / p_gcuform_xcheck).
+  describe "gcu_form" do
+    test "attributes on change, SET& forms, the end A5 (GCU's default: palette changes dropped)" do
+      src = "color 3\nset-color 200 100 50\nline 40/256 40/256"
+
+      assert TelidrawTranspiler.transpile!(src, gcu_form: true) ==
+               Base.decode16!("A1C8C0C0C9A3C0C0D2C0BECCABC0C0C0C0EDC0A5")
+    end
+
+    test "palette: true writes the changed palette entries before each object (GCU's DS:8418)" do
+      src = "color 3\nset-color 200 100 50\nline 40/256 40/256"
+
+      assert TelidrawTranspiler.transpile!(src, gcu_form: true, palette: true) ==
+               Base.decode16!("BECCBCE2C0C0A1C8C0C0C9A3C0C0D2C0BECCABC0C0C0C0EDC0A5")
+
+      # RESET's palette reset restores entry 3, and keeps its palette bits
+      src2 = src <> "\nreset color 1\nline 80/256 40/256"
+
+      assert TelidrawTranspiler.transpile!(src2, gcu_form: true, palette: true) ==
+               Base.decode16!(
+                 "BECCBCE2C0C0A1C8C0C0C9A3C0C0D2C0BECCABC0C0C0C0EDC0BECCBCC7F8FFBEDCA0C2C0ABC0EDC0C0E8C0A5"
+               )
+
+      assert TelidrawTranspiler.transpile!(src2, gcu_form: true) ==
+               Base.decode16!("A1C8C0C0C9A3C0C0D2C0BECCABC0C0C0C0EDC0BEDCA0C0C0ABC0EDC0C0E8C0A5")
+    end
+
+    test "what GCU would change instead of keep is a diagnostic" do
+      assert {:error, [%{message: msg}]} =
+               TelidrawTranspiler.transpile("text-style rotation 90\nmove 64/256 64/256\ntext \"a\"", gcu_form: true)
+
+      assert msg =~ "gcu_form: rotated text"
+
+      assert {:error, [%{message: "gcu_form needs a complete file (init: true)"}]} =
+               TelidrawTranspiler.transpile("line 0 0", gcu_form: true, init: false)
     end
   end
 end

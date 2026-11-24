@@ -73,6 +73,21 @@ Without it, GCU reads the end of the file as the last command's final operand
 (a trailing LINE REL gains a bogus vertex), so complete files get it and
 `init: false` fragments stay bare.
 
+`:gcu_form` (default `false`) writes the file in **GCU's normalized form**: the
+bytes GCU itself writes when it loads the file and saves it again
+(`NaplpsGcuForm.normalize/2`). Attributes are written only where they change,
+lines and rectangles get their SET& forms, a start the pen is already at is left
+out, LINE REL runs become one object, and text repeats are compressed with
+REPEAT. It needs `init: true`. A construct GCU would change instead of keep
+(text off the screen or past its edge, rotated text, text in a custom field away
+from its left edge, …) is a diagnostic rather than a guess. `:palette` (default
+`false`) adds GCU's palette definition table (`BE <i> BC <rgb>` before each
+object whose palette changed, GCU's DS:8418 option). Without it, as with GCU's
+default configuration, palette changes are dropped.
+
+Plain output already avoids the places where GCU's reader would read the bytes
+differently from the NAPLPS spec (see "GCU's reader" in `telidraw.md`).
+
 ### Language coverage
 
 * **Drawing verbs** — `move`/`goto`, `point`, `line`, `rect`/`rect-outline`,
