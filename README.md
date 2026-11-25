@@ -101,6 +101,15 @@ differently from the NAPLPS spec (see "GCU's reader" in `telidraw.md`).
 * **Attributes** — `color` (palette index, `fg`/`fg bg`), `set-color` (RGB),
   `texture` (with an optional mask size), `domain` (with an optional pel size),
   `text-style`, `wait`, `blink`, `field`, `reset` (with flags), `nsr`.
+* **Definitions** — `def-texture N { … }` defines texture mask A–D (DEF TEXTURE),
+  which `texture` fills 4–7 then use; `@macro proc name() [code] { … }` defines a
+  macro (DEF MACRO, codes from `0x20` or given), and `@name` / `@name ss3` plays
+  it at the pen. The bytes are GCU's: `84 <mask> … 85` and `80 <code> … A5 85`,
+  each followed by `ESC ) W ESC ~`, and calls as `ESC / z ESC o <code>` (or SS3).
+* **Text** — `text` (printable characters, optionally sized), `text-raw` for
+  control codes inside text (`\xHH` escapes: CR/LF, reverse video, underline,
+  REPEAT, …), written with GCU's text rules (a toggle only when it changes, SI
+  only after an ESC), and the character sets above.
 * **Structure** — `with { … }` blocks (compile to explicit set-then-restore),
   `repeat`, `for … in a..b`, `if/else`, `proc` definitions and calls (inlined),
   `let` and `palette` bindings, and compile-time arithmetic
@@ -108,6 +117,9 @@ differently from the NAPLPS spec (see "GCU's reader" in `telidraw.md`).
 * **Directives** — `#coord fractions|pixels`, `#resolution W H`, `#bits`.
 * **Raw escape hatch** — `raw <opcode> <bytes…>` and the UPPERCASE mnemonic
   pass-through forms (see below).
+
+`telidraw.md` is the full language reference, including the pen after each
+command and the places where GCU reads bytes differently from the spec.
 
 ### Uppercase mnemonics vs. lowercase keywords
 
@@ -147,10 +159,23 @@ parser; `TelidrawTranspiler.Error` is raised by `transpile!/2`.
 ### Limitations
 
 * Geometry is emitted at multi-byte value 3 (three operand bytes per vertex),
-  which is what `NaplpsWriter.mb_xy/2` and `gcu_init/0` assume.
+  which is what `NaplpsWriter.mb_xy/2` and `gcu_init/0` assume. This is the only
+  resolution Prodigy uses; other DOMAIN sizes are not supported.
 * `#bits 7` (7-bit transmission) is **not** supported — `NaplpsWriter.mb_xy/2`
   hardcodes the 8-bit `0xC0` numerical base. A `#bits 7` directive emits a
   diagnostic and output stays 8-bit.
+* `gcu_form: true` writes GCU's ABSOLUTE save only. GCU's other save options
+  (RELATIVE, page mode, start at object, clipping) are not available.
+* `gcu_form: true` is byte-identical to GCU's own re-save except in two places:
+  - **Macro bodies.** GCU re-encodes a macro's body from the objects it recorded
+    (for example it joins two `line-rel` commands into one LINE REL, and drops a
+    polygon's zero first vertex); the body is written as compiled.
+  - **Calls after calls.** GCU positions a second macro call from a pen it never
+    updated after the first one, which moves the call; `gcu_form` keeps the call
+    where it was drawn.
+* Text GCU would change rather than keep — off the screen, rotated, in a path
+  other than right, cursor controls inside it, or in a custom `field` away from
+  its left edge — is a `gcu_form` diagnostic, not a guess.
 
 ### Examples & tests
 
